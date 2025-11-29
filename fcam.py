@@ -249,8 +249,8 @@ def setup_live_plot():
     """Setup matplotlib figure for live robot tracking"""
     plt.ion()  # Interactive mode
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(-2, 2)
+    ax.set_xlim(-5, 5)
+    ax.set_ylim(-5, 5)
     ax.set_xlabel('X (meters)')
     ax.set_ylabel('Y (meters)')
     ax.set_title('Robot Movement (Estimated)')
@@ -273,8 +273,8 @@ def setup_live_plot():
 def update_plot(ax):
     """Update the live plot with current robot position"""
     ax.clear()
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(-2, 2)
+    ax.set_xlim(-5, 5)
+    ax.set_ylim(-5, 5)
     ax.set_xlabel('X (meters)')
     ax.set_ylabel('Y (meters)')
     ax.set_title(f'Robot Movement - Angle: {robot_angle:.0f}° - Last: {last_command}')
@@ -419,7 +419,7 @@ def run_navigation_loop(sock, model,stop_n_think):
                 logger.error("ERROR: Failed to capture image, retrying...")
                 time.sleep(0.5)
                 continue
-            
+
             # Navigate using YOLO - looking for chair
             try:
                 result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None)
