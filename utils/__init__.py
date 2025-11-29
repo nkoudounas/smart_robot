@@ -15,10 +15,9 @@ from .detection_utils import (
     get_centered_object
 )
 
-# from .navigation_utils import (
-#     navigate_with_yolo,
-#     navigate_with_sensor_fusion
-# )
+from .navigation_utils import (
+    navigate_with_yolo,
+)
 
 # from .ui_utils import (
 #     print_controls,
@@ -40,8 +39,8 @@ __all__ = [
     'initialize_yolo_model', 'detect_objects_yolo', 'get_largest_object',
     'filter_objects_by_class', 'get_centered_object',
     
-    # # Navigation
-    # 'navigate_with_yolo', 'navigate_with_sensor_fusion',
+    # Navigation
+    'navigate_with_yolo',
     
     # # UI
     # 'print_controls', 'handle_keyboard_input', 'setup_camera_window',
