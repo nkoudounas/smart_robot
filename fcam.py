@@ -42,7 +42,7 @@ from utils.detection_utils import (
 )
 
 # Import navigation functions
-from utils.navigation_utils import navigate_with_yolo, thinking_mode
+from utils.navigation_utils import navigate_with_yolo, movement_delay, movement_speed, MOVEMENT_DELAYS, MOVEMENT_SPEEDS
 from utils.depth_estimation import DepthEstimator
 
 # Global variables
@@ -68,6 +68,12 @@ detected_objects = []
 
 # Depth estimator
 depth_estimator = DepthEstimator()
+
+# Stuck detection (frame comparison)
+previous_frame = None
+stuck_counter = 0
+STUCK_THRESHOLD = 3  # Number of similar frames before considering stuck
+PIXEL_DIFF_THRESHOLD = 0.02  # 2% pixel difference threshold
 
 
 def connect_to_robot():
@@ -151,8 +157,8 @@ def handle_keyboard_input(sock):
         paused = True
         logger.info("\n↑ Manual: Moving forward")
         if check_connection(sock):
-            cmd(sock, 'move', where='forward', at=70)
-        time.sleep(0.1)
+            cmd(sock, 'move', where='forward', at=movement_speed('manual'))
+        movement_delay('manual')
         return 'manual'
         
     elif key == 84 or key == 1:  # Down arrow
@@ -160,8 +166,8 @@ def handle_keyboard_input(sock):
         paused = True
         logger.info("\n↓ Manual: Moving backward")
         if check_connection(sock):
-            cmd(sock, 'move', where='back', at=70)
-        time.sleep(0.1)
+            cmd(sock, 'move', where='back', at=movement_speed('manual'))
+        movement_delay('manual')
         return 'manual'
         
     elif key == 81 or key == 2:  # Left arrow
@@ -169,8 +175,8 @@ def handle_keyboard_input(sock):
         paused = True
         logger.info("\n← Manual: Turning left")
         if check_connection(sock):
-            cmd(sock, 'move', where='left', at=70)
-        time.sleep(0.1)
+            cmd(sock, 'move', where='left', at=movement_speed('manual'))
+        movement_delay('manual')
         return 'manual'
         
     elif key == 83 or key == 3:  # Right arrow
@@ -178,8 +184,8 @@ def handle_keyboard_input(sock):
         paused = True
         logger.info("\n→ Manual: Turning right")
         if check_connection(sock):
-            cmd(sock, 'move', where='right', at=70)
-        time.sleep(0.1)
+            cmd(sock, 'move', where='right', at=movement_speed('manual'))
+        movement_delay('manual')
         return 'manual'
     
     # Space to stop
@@ -251,6 +257,54 @@ def mark_obstacle(distance_cm):
     obstacle_y.append(obs_y)
     
     logger.info(f"📍 Obstacle marked at ({obs_x:.2f}, {obs_y:.2f}), distance: {distance_cm}cm")
+
+
+def is_robot_stuck(current_frame):
+    """
+    Detect if robot is stuck by comparing current frame with previous frame.
+    Returns: True if robot appears stuck (similar frames for multiple iterations)
+    """
+    global previous_frame, stuck_counter
+    
+    if previous_frame is None:
+        previous_frame = current_frame.copy()
+        return False
+    
+    # Resize both frames to same size for comparison (in case of any mismatch)
+    h, w = current_frame.shape[:2]
+    prev_resized = cv.resize(previous_frame, (w, h))
+    
+    # Convert to grayscale for comparison
+    current_gray = cv.cvtColor(current_frame, cv.COLOR_BGR2GRAY)
+    prev_gray = cv.cvtColor(prev_resized, cv.COLOR_BGR2GRAY)
+    
+    # Calculate absolute difference
+    diff = cv.absdiff(current_gray, prev_gray)
+    
+    # Calculate percentage of pixels that changed significantly (threshold > 30)
+    changed_pixels = np.sum(diff > 30)
+    total_pixels = diff.size
+    change_ratio = changed_pixels / total_pixels
+    
+    logger.debug(f"Frame change: {change_ratio*100:.2f}%")
+    
+    # If change is below threshold, increment stuck counter
+    if change_ratio < PIXEL_DIFF_THRESHOLD:
+        stuck_counter += 1
+        logger.warning(f"⚠️ Low frame change detected ({stuck_counter}/{STUCK_THRESHOLD})")
+    else:
+        stuck_counter = 0  # Reset if significant change detected
+    
+    # Update previous frame
+    previous_frame = current_frame.copy()
+    
+    # Return True if stuck for multiple frames
+    if stuck_counter >= STUCK_THRESHOLD:
+        logger.error(f"🚫 ROBOT STUCK DETECTED! ({stuck_counter} similar frames)")
+        stuck_counter = 0  # Reset counter after detection
+        return True
+    
+    return False
 
 
 def mark_detected_objects(objects, image_width):
@@ -388,51 +442,32 @@ def update_plot(ax):
     plt.pause(0.001)  # Very short pause to update display
 
 
-def periodic_reconnect(sock, iteration,stop_n_think = False):
+def periodic_reconnect(sock, threshold=3):
     """
     Perform periodic reconnection to prevent robot firmware timeout.
     Robot firmware closes connection after 8 commands.
-    Reconnects based on actual command count, not iteration.
+    Reconnects based on actual command count (not iteration count).
+    
+    Args:
+        threshold: Number of commands before reconnecting (default 3)
+                   Use lower threshold (2) when navigation may use multiple commands
+    
     Returns: new socket or None if failed
     """
-    # Check if we've sent 3 or more commands
-    if should_reconnect(threshold=3):
+    # Check if we've sent enough commands to warrant reconnection
+    if should_reconnect(threshold=threshold):
         cmds = get_commands_sent()
         logger.warning(f"\n[Maintenance: {cmds} commands sent - reconnecting before robot limit]")
         
-        # Reconnect FIRST to reset command buffer
+        # Reconnect to reset command buffer
         sock = reconnect_robot(sock)
         
         if sock is None:
             return None
         
-        if stop_n_think:
-            # Now do maintenance with fresh connection - check if thinking mode needed
-            try:
-                thinking_activated, movements, obstacle_distance = thinking_mode(sock)
-                
-                # Update position for movements made in thinking mode
-                if thinking_activated:
-                    # Mark obstacle position before moving
-                    if obstacle_distance is not None:
-                        mark_obstacle(obstacle_distance)
-                    
-                    # Update position for movements made
-                    for move_cmd, duration in movements:
-                        update_robot_position(move_cmd, duration)
-                    
-                    # Thinking mode used 3 commands - reconnect immediately
-                    logger.warning("[Thinking mode active - reconnecting to reset buffer]")
-                    sock = reconnect_robot(sock)
-                    if sock is None:
-                        return None
-                # If not activated, we only used 1 command (distance check), which is fine
-                
-            except Exception as e:
-                logger.error(f"Error in periodic thinking mode: {e}")
-                pass
-        
         return sock
+    
+    return sock
     
     return sock
 
@@ -490,7 +525,8 @@ def run_navigation_loop(sock, model,stop_n_think):
                 logger.info(f"\n--- Iteration {iteration_count} ---")
             
             # Periodic reconnect to prevent firmware timeout
-            new_sock = periodic_reconnect(sock, iteration_count,stop_n_think)
+            # Use threshold=2 because navigation may use up to 2 commands (ultrasonic + move)
+            new_sock = periodic_reconnect(sock, threshold=2)
             if new_sock is None:
                 logger.error("Press 'r' to retry or 'k' to exit")
                 paused = True
@@ -504,7 +540,51 @@ def run_navigation_loop(sock, model,stop_n_think):
                 time.sleep(0.5)
                 continue
 
+            # Check if robot is stuck (same view for multiple frames)
+            if is_robot_stuck(img):
+                logger.error("🚨 Robot appears STUCK! Taking evasive action...")
+                
+                # Use vision-based recovery to intelligently choose escape direction
+                from utils.navigation_utils import vision_based_stuck_recovery
+                
+                # Define capture callback to get fresh frames
+                def capture_frame():
+                    frame = capture()
+                    if frame is None:
+                        logger.error("Failed to capture frame during stuck recovery")
+                        return None
+                    return frame
+                
+                # Execute vision-based recovery with reconnection support
+                try:
+                    sock, chosen_dir, left_score, right_score = vision_based_stuck_recovery(
+                        sock, capture_frame, reconnect_robot
+                    )
+                    if sock is None:
+                        logger.error("Lost connection during stuck recovery")
+                        paused = True
+                        continue
+                    logger.info(f"✅ Stuck recovery complete - chose {chosen_dir.upper()} path")
+                except Exception as e:
+                    logger.error(f"Vision recovery failed: {e}, using fallback (back + left)")
+                    # Fallback to simple recovery
+                    cmd(sock, 'move', where='back', at=movement_speed('back_avoid'))
+                    movement_delay('unstuck_back')
+                    cmd(sock, 'move', where='left', at=movement_speed('left_unstuck'))
+                    movement_delay('unstuck_turn')
+                    # Reconnect after fallback
+                    sock = reconnect_robot(sock)
+                    if sock is None:
+                        logger.error("Failed to reconnect after fallback unstuck maneuver")
+                        paused = True
+                        continue
+                
+                # Skip navigation this iteration
+                update_plot(ax)
+                continue
+
             # Navigate using YOLO - looking for chair
+            # Ultrasonic check is now INSIDE navigate_with_yolo when moving forward
             try:
                 # First, detect objects for marking on map
                 from utils.detection_utils import detect_objects_yolo
@@ -517,15 +597,33 @@ def run_navigation_loop(sock, model,stop_n_think):
                 # Now navigate
                 result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None)
                 
+                # If ultrasonic triggered, we used 3 commands - reconnect immediately
+                if result == 'ultrasonic_avoid':
+                    logger.warning(f"\n[Ultrasonic avoid used 3 commands - reconnecting]")
+                    sock = reconnect_robot(sock)
+                    if sock is None:
+                        logger.error("Failed to reconnect after ultrasonic avoid")
+                        paused = True
+                        continue
+                
                 # Update position estimate based on navigation result
                 if result and result != 'idle':
-                    if result in ['forward', 'back']:
-                        update_robot_position(result, duration=0.3)
-                    elif result in ['left', 'right', 'avoid_left', 'avoid_right']:
-                        cmd_type = result.replace('avoid_', '')
-                        update_robot_position(cmd_type, duration=0.3)
-                    elif result == 'searching':
-                        update_robot_position('right', duration=0.3)
+                    if result == 'ultrasonic_avoid':
+                        # Ultrasonic avoid does back then right
+                        # Duration uses the actual delays from MOVEMENT_DELAYS
+                        update_robot_position('back', duration=MOVEMENT_DELAYS['back'])
+                        update_robot_position('right', duration=MOVEMENT_DELAYS['right'])
+                    elif result in ['forward', 'back']:
+                        update_robot_position(result, duration=MOVEMENT_DELAYS[result])
+                    elif result in ['left', 'right', 'avoid_left', 'avoid_right', 'avoid_blocker', 'searching']:
+                        cmd_type = result.replace('avoid_', '').replace('_blocker', '')
+                        if cmd_type == 'searching':
+                            # flip a coin to decide turn direction
+                            if np.random.rand() < 0.5:
+                                cmd_type = 'left'
+                            else:
+                                cmd_type = 'right'
+                        update_robot_position(cmd_type, duration=MOVEMENT_DELAYS.get(cmd_type, MOVEMENT_DELAYS['default']))
                 
                 # Update live plot
                 update_plot(ax)
@@ -549,7 +647,7 @@ def run_navigation_loop(sock, model,stop_n_think):
                 continue
             
             # Delay between commands
-            time.sleep(0.3)
+            movement_delay('default')
             
     except KeyboardInterrupt:
         logger.critical("\n\nEmergency stop - Ctrl+C pressed!")
@@ -574,7 +672,7 @@ def run_navigation_loop(sock, model,stop_n_think):
 def main(stop_n_think):
     """Main entry point"""
     # Initialize YOLO model
-    model = initialize_yolo_model('yolov8s.pt')
+    model = initialize_yolo_model('yolo11l.pt')
     
     # Connect to robot
     sock = connect_to_robot()
