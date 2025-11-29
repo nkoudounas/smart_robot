@@ -20,22 +20,30 @@ def thinking_mode(sock):
     2. Move backward
     3. Turn based on IR sensors (left if blocked on right, right otherwise)
     
-    Returns: tuple (activated: bool, movements: list) where movements are ('back', 0.8) and ('left'/'right', 0.6)
+    Returns: tuple (activated: bool, movements: list, distance: float or None) 
+             where movements are ('back', 0.8) and ('left'/'right', 0.6)
+             distance is the measured distance in cm if obstacle detected
     """
     # Command 1: Check distance (uses 1 command)
     distance = read_distance(sock)
     
     if distance is None:
         logger.warning("⚠ Could not read distance sensor")
-        return False, []
+        return False, [], None
     
-    logger.debug(f"Distance: {distance}cm")
+    logger.info(f"🔍 Distance reading: {distance}cm")
+    
+    # Ignore invalid readings (0 or very large numbers usually mean no detection)
+    if distance == 0 or distance > 200:
+        logger.debug(f"Invalid/no reading ({distance}cm), skipping thinking mode")
+        return False, [], None
     
     # Only activate thinking mode if too close
     if distance >= 20:
-        return False, []
+        logger.debug(f"Safe distance ({distance}cm), no thinking mode needed")
+        return False, [], None
     
-    # THINKING MODE ACTIVATED
+    # THINKING MODE ACTIVATED - obstacle detected!
     logger.error(f"\n🧠 THINKING MODE: Object at {distance}cm - backing up!")
     
     movements = []
@@ -62,7 +70,7 @@ def thinking_mode(sock):
         movements.append(('right', 0.6))
     
     logger.info("✓ Thinking mode complete (used 3 commands)")
-    return True, movements
+    return True, movements, distance
 
 
 def check_ultrasonic_distance(sock):

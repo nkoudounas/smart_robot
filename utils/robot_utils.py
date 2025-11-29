@@ -237,3 +237,13 @@ def read_ir_sensors(sock):
         # Result: 1 = on ground, 0 = off ground/edge detected
         return result
     return None
+
+
+def get_commands_sent():
+    """Get the number of commands sent since last reconnect"""
+    return commands_sent
+
+
+def should_reconnect(threshold=3):
+    """Check if we should reconnect based on command count"""
+    return commands_sent >= threshold

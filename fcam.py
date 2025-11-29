@@ -32,7 +32,7 @@ handler.setFormatter(colorlog.ColoredFormatter(
 logger.addHandler(handler)
 
 # Import robot utility functions
-from utils.robot_utils import capture, cmd, check_connection, setup_socket_options, reconnect_robot
+from utils.robot_utils import capture, cmd, check_connection, setup_socket_options, reconnect_robot, should_reconnect, get_commands_sent
 
 # Import detection utility functions
 from utils.detection_utils import (
@@ -56,6 +56,10 @@ robot_angle = 90.0  # degrees, 0=right, 90=up, 180=left, 270=down
 path_x = [0.0]
 path_y = [0.0]
 last_command = None
+
+# Obstacle tracking (objects detected by ultrasonic sensor)
+obstacle_x = []
+obstacle_y = []
 
 
 def connect_to_robot():
@@ -220,6 +224,27 @@ def update_robot_position(command, duration=0.5):
     path_y.append(robot_y)
 
 
+def mark_obstacle(distance_cm):
+    """
+    Mark obstacle position based on current robot position and direction.
+    Distance is measured by ultrasonic sensor in cm.
+    """
+    global obstacle_x, obstacle_y
+    
+    # Convert distance to meters and calculate obstacle position
+    distance_m = distance_cm / 100.0
+    
+    # Obstacle is in front of robot (in direction of robot_angle)
+    obs_x = robot_x + distance_m * np.cos(np.radians(robot_angle))
+    obs_y = robot_y + distance_m * np.sin(np.radians(robot_angle))
+    
+    # Add to obstacle list
+    obstacle_x.append(obs_x)
+    obstacle_y.append(obs_y)
+    
+    logger.info(f"📍 Obstacle marked at ({obs_x:.2f}, {obs_y:.2f}), distance: {distance_cm}cm")
+
+
 def setup_live_plot():
     """Setup matplotlib figure for live robot tracking"""
     plt.ion()  # Interactive mode
@@ -256,6 +281,11 @@ def update_plot(ax):
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
     
+    # Plot obstacles detected by ultrasonic sensor
+    if len(obstacle_x) > 0:
+        ax.scatter(obstacle_x, obstacle_y, c='red', marker='x', s=100, linewidths=3, 
+                  label=f'Obstacles ({len(obstacle_x)})', zorder=5)
+    
     # Plot path
     if len(path_x) > 1:
         ax.plot(path_x, path_y, 'b-', alpha=0.5, linewidth=2, label='Path')
@@ -278,10 +308,13 @@ def periodic_reconnect(sock, iteration,stop_n_think = False):
     """
     Perform periodic reconnection to prevent robot firmware timeout.
     Robot firmware closes connection after 8 commands.
+    Reconnects based on actual command count, not iteration.
     Returns: new socket or None if failed
     """
-    if iteration % 3 == 0 and iteration > 0:
-        logger.warning("\n[Periodic maintenance: reconnecting before robot limit]")
+    # Check if we've sent 3 or more commands
+    if should_reconnect(threshold=3):
+        cmds = get_commands_sent()
+        logger.warning(f"\n[Maintenance: {cmds} commands sent - reconnecting before robot limit]")
         
         # Reconnect FIRST to reset command buffer
         sock = reconnect_robot(sock)
@@ -292,17 +325,25 @@ def periodic_reconnect(sock, iteration,stop_n_think = False):
         if stop_n_think:
             # Now do maintenance with fresh connection - check if thinking mode needed
             try:
-                thinking_activated, movements = thinking_mode(sock)
-                if not thinking_activated:
-                    # Distance was safe, just stop
-                    cmd(sock, 'stop')
-                    time.sleep(0.2)
-                else:
+                thinking_activated, movements, obstacle_distance = thinking_mode(sock)
+                
+                # Update position for movements made in thinking mode
+                if thinking_activated:
+                    # Mark obstacle position before moving
+                    if obstacle_distance is not None:
+                        mark_obstacle(obstacle_distance)
+                    
+                    # Update position for movements made
+                    for move_cmd, duration in movements:
+                        update_robot_position(move_cmd, duration)
+                    
                     # Thinking mode used 3 commands - reconnect immediately
                     logger.warning("[Thinking mode active - reconnecting to reset buffer]")
                     sock = reconnect_robot(sock)
                     if sock is None:
                         return None
+                # If not activated, we only used 1 command (distance check), which is fine
+                
             except Exception as e:
                 logger.error(f"Error in periodic thinking mode: {e}")
                 pass
