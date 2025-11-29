@@ -25,10 +25,10 @@ from .navigation_utils import (
 #     setup_camera_window
 # )
 
-# from .connection_utils import (
-#     connect_to_robot,
-#     periodic_reconnect
-# )
+from .connection_utils import (
+    connect_to_robot,
+    periodic_reconnect
+)
 
 __all__ = [
     # Robot communication
@@ -45,6 +45,6 @@ __all__ = [
     # # UI
     # 'print_controls', 'handle_keyboard_input', 'setup_camera_window',
     
-    # # Connection
-    # 'connect_to_robot', 'periodic_reconnect'
+    # Connection
+    'connect_to_robot', 'periodic_reconnect'
 ]

@@ -45,6 +45,8 @@ from utils.detection_utils import (
 from utils.navigation_utils import navigate_with_yolo, movement_delay, movement_speed, MOVEMENT_DELAYS, MOVEMENT_SPEEDS
 from utils.depth_estimation import DepthEstimator
 
+from utils.connection_utils import connect_to_robot,periodic_reconnect
+
 # Global variables
 iteration_count = 0
 paused = False
@@ -74,29 +76,6 @@ previous_frame = None
 stuck_counter = 0
 STUCK_THRESHOLD = 3  # Number of similar frames before considering stuck
 PIXEL_DIFF_THRESHOLD = 0.02  # 2% pixel difference threshold
-
-
-def connect_to_robot():
-    """Establish connection to robot"""
-    logger.info("Connecting to robot at 192.168.4.1:100...")
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10.0)
-        sock.connect(('192.168.4.1', 100))
-        
-        # Apply socket options
-        setup_socket_options(sock)
-        
-        logger.info("✓ Connected to robot successfully!")
-        logger.info(f"Local address: {sock.getsockname()}")
-        logger.info(f"Remote address: {sock.getpeername()}")
-        return sock
-    except socket.timeout:
-        logger.error("ERROR: Connection timeout. Is the robot powered on?")
-        sys.exit(1)
-    except socket.error as e:
-        logger.error(f"ERROR: Connection failed: {e}")
-        sys.exit(1)
 
 
 def print_controls():
@@ -440,36 +419,6 @@ def update_plot(ax):
     ax.legend()
     plt.draw()
     plt.pause(0.001)  # Very short pause to update display
-
-
-def periodic_reconnect(sock, threshold=3):
-    """
-    Perform periodic reconnection to prevent robot firmware timeout.
-    Robot firmware closes connection after 8 commands.
-    Reconnects based on actual command count (not iteration count).
-    
-    Args:
-        threshold: Number of commands before reconnecting (default 3)
-                   Use lower threshold (2) when navigation may use multiple commands
-    
-    Returns: new socket or None if failed
-    """
-    # Check if we've sent enough commands to warrant reconnection
-    if should_reconnect(threshold=threshold):
-        cmds = get_commands_sent()
-        logger.warning(f"\n[Maintenance: {cmds} commands sent - reconnecting before robot limit]")
-        
-        # Reconnect to reset command buffer
-        sock = reconnect_robot(sock)
-        
-        if sock is None:
-            return None
-        
-        return sock
-    
-    return sock
-    
-    return sock
 
 
 def run_navigation_loop(sock, model,stop_n_think):
