@@ -17,7 +17,7 @@ def capture():
     """Capture image from robot camera (HTTP, not socket command)"""
     global cmd_no
     cmd_no += 1
-    print(str(cmd_no) + ': capture image', end=' ')
+    print(f"cmd_no: {str(cmd_no)}" + ': capture image', end=' ')
     
     max_retries = 3
     for attempt in range(max_retries):

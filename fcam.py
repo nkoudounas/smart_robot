@@ -9,6 +9,23 @@ import socket
 import sys
 import struct
 import time
+import colorlog
+
+# Setup colored logging
+logger = colorlog.getLogger()
+logger.setLevel(colorlog.INFO)
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(
+    '%(log_color)s%(message)s',
+    log_colors={
+        'DEBUG': 'cyan',
+        'INFO': 'white',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
+        'CRITICAL': 'red,bg_white',
+    }
+))
+logger.addHandler(handler)
 
 # Import robot utility functions
 from utils.robot_utils import capture, cmd, check_connection, setup_socket_options, reconnect_robot
@@ -40,7 +57,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
     
     if len(objects) == 0:
         # No objects detected, move forward slowly
-        print("No objects detected, moving forward")
+        logger.info("No objects detected, moving forward")
+        logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
         cmd(sock, 'move', where='forward', at=50)
         return 'forward'
     
@@ -55,24 +73,28 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
             if target['position'] == 'center':
                 # Check if close enough (object is large)
                 if target['area'] > width * height * 0.3:
-                    print(f"Reached {target_class}, stopping")
+                    logger.info(f"Reached {target_class}, stopping")
+                    logger.debug("\033[91m■ STOP\033[0m")  # Red
                     cmd(sock, 'stop')
                     return 'reached'
                 else:
-                    print(f"Target {target_class} centered, moving forward")
+                    logger.info(f"Target {target_class} centered, moving forward")
+                    logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
                     cmd(sock, 'move', where='forward', at=60)
                     return 'forward'
             elif target['position'] == 'left':
-                print(f"Target {target_class} on left, turning left")
+                logger.info(f"Target {target_class} on left, turning left")
+                logger.debug("\033[95m← Turning LEFT\033[0m")  # Magenta
                 cmd(sock, 'move', where='left', at=50)
                 return 'left'
             else:  # right
-                print(f"Target {target_class} on right, turning right")
+                logger.info(f"Target {target_class} on right, turning right")
+                logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                 cmd(sock, 'move', where='right', at=50)
                 return 'right'
         else:
             # Target not found, search by rotating
-            print(f"Searching for {target_class}...")
+            logger.warning(f"Searching for {target_class}...")
             cmd(sock, 'move', where='right', at=40)
             return 'searching'
     
@@ -85,22 +107,25 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
     if obstacles:
         # Find largest/closest obstacle
         obstacle = get_largest_object(obstacles)
-        
+        logger.warning(f"obstacle: {obstacle}\n")
         # If obstacle is too close (large area), take action
         if obstacle['area'] > width * height * 0.15:
-            print(f"Avoiding {obstacle['class']} ({obstacle['position']})")
+            logger.error(f"Avoiding {obstacle['class']} ({obstacle['position']})")
             if obstacle['position'] == 'center':
+                logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                 cmd(sock, 'move', where='right', at=60)
                 return 'avoid_right'
             elif obstacle['position'] == 'left':
+                logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                 cmd(sock, 'move', where='right', at=50)
                 return 'avoid_right'
             else:  # right
+                logger.debug("\033[95m← Turning LEFT\033[0m")  # Magenta
                 cmd(sock, 'move', where='left', at=50)
                 return 'avoid_left'
         else:
             # Obstacles far enough, can move forward
-            print("Path clear, moving forward")
+            logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
             cmd(sock, 'move', where='forward', at=60)
             return 'forward'
     
@@ -109,7 +134,7 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
 
 def connect_to_robot():
     """Establish connection to robot"""
-    print("Connecting to robot at 192.168.4.1:100...")
+    logger.info("Connecting to robot at 192.168.4.1:100...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10.0)
@@ -118,31 +143,31 @@ def connect_to_robot():
         # Apply socket options
         setup_socket_options(sock)
         
-        print("✓ Connected to robot successfully!")
-        print(f"Local address: {sock.getsockname()}")
-        print(f"Remote address: {sock.getpeername()}")
+        logger.info("✓ Connected to robot successfully!")
+        logger.info(f"Local address: {sock.getsockname()}")
+        logger.info(f"Remote address: {sock.getpeername()}")
         return sock
     except socket.timeout:
-        print("ERROR: Connection timeout. Is the robot powered on?")
+        logger.error("ERROR: Connection timeout. Is the robot powered on?")
         sys.exit(1)
     except socket.error as e:
-        print(f"ERROR: Connection failed: {e}")
+        logger.error(f"ERROR: Connection failed: {e}")
         sys.exit(1)
 
 
 def print_controls():
     """Print keyboard control instructions"""
-    print("\nKeyboard Controls:")
-    print("  'k' - Stop and exit")
-    print("  'r' - Restart navigation")
-    print("  'p' - Pause/resume autonomous mode")
-    print("  Arrow Keys - Manual control:")
-    print("    ↑ (Up)    - Move forward")
-    print("    ↓ (Down)  - Move backward")
-    print("    ← (Left)  - Turn left")
-    print("    → (Right) - Turn right")
-    print("  Space - Stop robot")
-    print("  Ctrl+C - Emergency stop")
+    logger.info("\nKeyboard Controls:")
+    logger.info("  'k' - Stop and exit")
+    logger.info("  'r' - Restart navigation")
+    logger.info("  'p' - Pause/resume autonomous mode")
+    logger.info("  Arrow Keys - Manual control:")
+    logger.info("    ↑ (Up)    - Move forward")
+    logger.info("    ↓ (Down)  - Move backward")
+    logger.info("    ← (Left)  - Turn left")
+    logger.info("    → (Right) - Turn right")
+    logger.info("  Space - Stop robot")
+    logger.info("  Ctrl+C - Emergency stop")
 
 
 def handle_keyboard_input(sock):
@@ -156,12 +181,12 @@ def handle_keyboard_input(sock):
     
     # Exit command
     if key == ord('k'):
-        print("\n'k' pressed - Stopping and exiting...")
+        logger.warning("\n'k' pressed - Stopping and exiting...")
         return 'exit'
     
     # Restart command
     elif key == ord('r'):
-        print("\n'r' pressed - Restarting navigation...")
+        logger.info("\n'r' pressed - Restarting navigation...")
         iteration_count = 0
         manual_mode = False
         paused = False
@@ -175,18 +200,18 @@ def handle_keyboard_input(sock):
         paused = not paused
         manual_mode = False
         if paused:
-            print("\n'p' pressed - PAUSED (Autonomous mode disabled)")
+            logger.warning("\n'p' pressed - PAUSED (Autonomous mode disabled)")
             if check_connection(sock):
                 cmd(sock, 'stop')
         else:
-            print("'p' pressed - RESUMED (Autonomous mode enabled)")
+            logger.info("'p' pressed - RESUMED (Autonomous mode enabled)")
         return 'pause'
     
     # Manual controls with arrow keys
     elif key == 82 or key == 0:  # Up arrow
         manual_mode = True
         paused = True
-        print("\n↑ Manual: Moving forward")
+        logger.info("\n↑ Manual: Moving forward")
         if check_connection(sock):
             cmd(sock, 'move', where='forward', at=70)
         time.sleep(0.1)
@@ -195,7 +220,7 @@ def handle_keyboard_input(sock):
     elif key == 84 or key == 1:  # Down arrow
         manual_mode = True
         paused = True
-        print("\n↓ Manual: Moving backward")
+        logger.info("\n↓ Manual: Moving backward")
         if check_connection(sock):
             cmd(sock, 'move', where='back', at=70)
         time.sleep(0.1)
@@ -204,7 +229,7 @@ def handle_keyboard_input(sock):
     elif key == 81 or key == 2:  # Left arrow
         manual_mode = True
         paused = True
-        print("\n← Manual: Turning left")
+        logger.info("\n← Manual: Turning left")
         if check_connection(sock):
             cmd(sock, 'move', where='left', at=70)
         time.sleep(0.1)
@@ -213,7 +238,7 @@ def handle_keyboard_input(sock):
     elif key == 83 or key == 3:  # Right arrow
         manual_mode = True
         paused = True
-        print("\n→ Manual: Turning right")
+        logger.info("\n→ Manual: Turning right")
         if check_connection(sock):
             cmd(sock, 'move', where='right', at=70)
         time.sleep(0.1)
@@ -221,17 +246,17 @@ def handle_keyboard_input(sock):
     
     # Space to stop
     elif key == 32:  # Space bar
-        print("\nSpace pressed - Stopping robot")
+        logger.warning("\nSpace pressed - Stopping robot")
         if check_connection(sock):
             cmd(sock, 'stop')
         if not paused:
             paused = True
-            print("(Paused - press 'p' to resume autonomous mode)")
+            logger.info("(Paused - press 'p' to resume autonomous mode)")
         return 'stop'
     
     # Show key code for debugging
     elif key != 255:
-        print(f"\nKey pressed: {key} (press 'k' to exit)")
+        logger.debug(f"\nKey pressed: {key} (press 'k' to exit)")
     
     return None
 
@@ -243,7 +268,7 @@ def periodic_reconnect(sock, iteration):
     Returns: new socket or None if failed
     """
     if iteration % 3 == 0 and iteration > 0:
-        print("\n[Periodic maintenance: reconnecting before robot limit]")
+        logger.warning("\n[Periodic maintenance: reconnecting before robot limit]")
         try:
             cmd(sock, 'stop')
             time.sleep(0.2)
@@ -262,8 +287,8 @@ def run_navigation_loop(sock, model):
     """
     global iteration_count, paused
     
-    print("\nStarting autonomous navigation with YOLO...")
-    print("\nNOTE: Robot firmware closes connection after 8 commands - auto-reconnecting every 3 iterations")
+    logger.info("\nStarting autonomous navigation with YOLO...")
+    logger.warning("\nNOTE: Robot firmware closes connection after 8 commands - auto-reconnecting every 3 iterations")
     print_controls()
     
     # Setup camera window
@@ -292,7 +317,7 @@ def run_navigation_loop(sock, model):
             
             # Check connection
             if not check_connection(sock):
-                print("\nERROR: Lost connection to robot!")
+                logger.error("\nERROR: Lost connection to robot!")
                 break
             
             # Increment iteration
@@ -300,12 +325,12 @@ def run_navigation_loop(sock, model):
             
             # Show progress
             if iteration_count % 3 == 0:
-                print(f"\n--- Iteration {iteration_count} ---")
+                logger.info(f"\n--- Iteration {iteration_count} ---")
             
             # Periodic reconnect to prevent firmware timeout
             new_sock = periodic_reconnect(sock, iteration_count)
             if new_sock is None:
-                print("Press 'r' to retry or 'k' to exit")
+                logger.error("Press 'r' to retry or 'k' to exit")
                 paused = True
                 continue
             sock = new_sock
@@ -313,7 +338,7 @@ def run_navigation_loop(sock, model):
             # Capture image
             img = capture()
             if img is None:
-                print("ERROR: Failed to capture image, retrying...")
+                logger.error("ERROR: Failed to capture image, retrying...")
                 time.sleep(0.5)
                 continue
             
@@ -321,17 +346,17 @@ def run_navigation_loop(sock, model):
             try:
                 result = navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None)
             except Exception as e:
-                print(f"\n!!! ERROR in navigation at iteration {iteration_count}: {e}")
+                logger.error(f"\n!!! ERROR in navigation at iteration {iteration_count}: {e}")
                 result = None
             
             # Handle navigation failure
             if result is None:
-                print(f"\nERROR: Navigation command failed at iteration {iteration_count}!")
-                print("Attempting to recover...")
+                logger.error(f"\nERROR: Navigation command failed at iteration {iteration_count}!")
+                logger.warning("Attempting to recover...")
                 
                 new_sock = reconnect_robot(sock)
                 if new_sock is None:
-                    print("✗ Failed to reconnect. Press 'r' to retry or 'k' to exit")
+                    logger.error("✗ Failed to reconnect. Press 'r' to retry or 'k' to exit")
                     paused = True
                     continue
                 sock = new_sock
@@ -342,13 +367,13 @@ def run_navigation_loop(sock, model):
             time.sleep(0.3)
             
     except KeyboardInterrupt:
-        print("\n\nEmergency stop - Ctrl+C pressed!")
+        logger.critical("\n\nEmergency stop - Ctrl+C pressed!")
         if check_connection(sock):
             cmd(sock, 'stop')
         else:
-            print("Socket already disconnected")
+            logger.warning("Socket already disconnected")
     except Exception as e:
-        print(f"\n\nUnexpected error in main loop at iteration {iteration_count}: {e}")
+        logger.critical(f"\n\nUnexpected error in main loop at iteration {iteration_count}: {e}")
         import traceback
         traceback.print_exc()
         if check_connection(sock):
@@ -371,8 +396,8 @@ def main():
     # Run navigation loop
     final_iterations = run_navigation_loop(sock, model)
     
-    print(f"\nTotal iterations completed: {final_iterations}")
-    print("Program ended")
+    logger.info(f"\nTotal iterations completed: {final_iterations}")
+    logger.info("Program ended")
 
 
 if __name__ == '__main__':
