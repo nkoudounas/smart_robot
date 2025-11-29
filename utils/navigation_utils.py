@@ -4,11 +4,60 @@ Navigation functions for robot movement and obstacle avoidance
 
 import cv2 as cv
 import colorlog
+import time
 from .detection_utils import detect_objects_yolo, get_largest_object
-from .robot_utils import cmd, read_distance
+from .robot_utils import cmd, read_distance, read_ir_sensors
 
 # Setup logger
 logger = colorlog.getLogger(__name__)
+
+
+def thinking_mode(sock):
+    """
+    Emergency thinking mode when object is very close (< 20cm).
+    Uses exactly 3 commands to respect buffer limit:
+    1. Read distance
+    2. Move backward
+    3. Turn based on IR sensors (left if blocked on right, right otherwise)
+    
+    Returns: True if thinking mode was activated, False otherwise
+    """
+    # Command 1: Check distance (uses 1 command)
+    distance = read_distance(sock)
+    
+    if distance is None:
+        logger.warning("⚠ Could not read distance sensor")
+        return False
+    
+    logger.debug(f"Distance: {distance}cm")
+    
+    # Only activate thinking mode if too close
+    if distance >= 20:
+        return False
+    
+    # THINKING MODE ACTIVATED
+    logger.error(f"\n🧠 THINKING MODE: Object at {distance}cm - backing up!")
+    
+    # Command 2: Back up (uses 1 command)
+    cmd(sock, 'move', where='back', at=80)
+    time.sleep(0.8)  # Let it back up
+    
+    # Command 3: Check IR sensors and turn smartly (uses 1 command)
+    ir_result = read_ir_sensors(sock)
+    
+    if ir_result is not None and ir_result == 0:
+        # Edge detected or off ground - turn left (safer)
+        logger.warning("⚠ Edge/ground issue detected, turning LEFT")
+        cmd(sock, 'move', where='left', at=70)
+        time.sleep(0.6)
+    else:
+        # Normal operation - turn right to explore
+        logger.info("🔄 Turning RIGHT to avoid obstacle")
+        cmd(sock, 'move', where='right', at=70)
+        time.sleep(0.6)
+    
+    logger.info("✓ Thinking mode complete (used 3 commands)")
+    return True
 
 
 def check_ultrasonic_distance(sock):

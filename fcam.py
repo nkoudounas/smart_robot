@@ -38,7 +38,7 @@ from utils.detection_utils import (
 )
 
 # Import navigation functions
-from utils.navigation_utils import navigate_with_yolo
+from utils.navigation_utils import navigate_with_yolo, thinking_mode
 
 # Global variables
 iteration_count = 0
@@ -175,7 +175,7 @@ def handle_keyboard_input(sock):
     return None
 
 
-def periodic_reconnect(sock, iteration):
+def periodic_reconnect(sock, iteration,stop_n_think = False):
     """
     Perform periodic reconnection to prevent robot firmware timeout.
     Robot firmware closes connection after 8 commands.
@@ -189,18 +189,23 @@ def periodic_reconnect(sock, iteration):
         
         if sock is None:
             return None
-        if False:
-            # Now do maintenance with fresh connection
+        
+        if stop_n_think:
+            # Now do maintenance with fresh connection - check if thinking mode needed
             try:
-                cmd(sock, 'stop')
-                time.sleep(0.2)
-                
-                # Check ultrasonic distance after stopping
-                from utils.navigation_utils import check_ultrasonic_distance
-                distance = check_ultrasonic_distance(sock)
-                if distance is not None and distance < 20:
-                    logger.warning(f"Object very close ({distance}cm) during maintenance")
-            except:
+                thinking_activated = thinking_mode(sock)
+                if not thinking_activated:
+                    # Distance was safe, just stop
+                    cmd(sock, 'stop')
+                    time.sleep(0.2)
+                else:
+                    # Thinking mode used 3 commands - reconnect immediately
+                    logger.warning("[Thinking mode active - reconnecting to reset buffer]")
+                    sock = reconnect_robot(sock)
+                    if sock is None:
+                        return None
+            except Exception as e:
+                logger.error(f"Error in periodic thinking mode: {e}")
                 pass
         
         return sock
@@ -208,7 +213,7 @@ def periodic_reconnect(sock, iteration):
     return sock
 
 
-def run_navigation_loop(sock, model):
+def run_navigation_loop(sock, model,stop_n_think):
     """
     Main navigation loop with YOLO object detection.
     Returns: final iteration count
@@ -256,7 +261,7 @@ def run_navigation_loop(sock, model):
                 logger.info(f"\n--- Iteration {iteration_count} ---")
             
             # Periodic reconnect to prevent firmware timeout
-            new_sock = periodic_reconnect(sock, iteration_count)
+            new_sock = periodic_reconnect(sock, iteration_count,stop_n_think)
             if new_sock is None:
                 logger.error("Press 'r' to retry or 'k' to exit")
                 paused = True
@@ -313,7 +318,7 @@ def run_navigation_loop(sock, model):
     return iteration_count
 
 
-def main():
+def main(stop_n_think):
     """Main entry point"""
     # Initialize YOLO model
     model = initialize_yolo_model('yolov8s.pt')
@@ -322,11 +327,12 @@ def main():
     sock = connect_to_robot()
     
     # Run navigation loop
-    final_iterations = run_navigation_loop(sock, model)
+    final_iterations = run_navigation_loop(sock, model,stop_n_think)
     
     logger.info(f"\nTotal iterations completed: {final_iterations}")
     logger.info("Program ended")
 
 
 if __name__ == '__main__':
-    main()
+    stop_n_think = False
+    main(stop_n_think)
