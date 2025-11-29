@@ -43,6 +43,7 @@ from utils.detection_utils import (
 
 # Import navigation functions
 from utils.navigation_utils import navigate_with_yolo, thinking_mode
+from utils.depth_estimation import DepthEstimator
 
 # Global variables
 iteration_count = 0
@@ -60,6 +61,13 @@ last_command = None
 # Obstacle tracking (objects detected by ultrasonic sensor)
 obstacle_x = []
 obstacle_y = []
+
+# Detected objects tracking (vision-based with depth estimation)
+# Each entry: {'x': x, 'y': y, 'class': class_name, 'age': frames_old, 'confidence': float}
+detected_objects = []
+
+# Depth estimator
+depth_estimator = DepthEstimator()
 
 
 def connect_to_robot():
@@ -245,6 +253,59 @@ def mark_obstacle(distance_cm):
     logger.info(f"📍 Obstacle marked at ({obs_x:.2f}, {obs_y:.2f}), distance: {distance_cm}cm")
 
 
+def mark_detected_objects(objects, image_width):
+    """
+    Mark detected objects on the map with estimated positions.
+    Objects fade over time. Chair is green, others are black.
+    """
+    global detected_objects, depth_estimator
+    
+    # Age existing objects
+    for obj in detected_objects:
+        obj['age'] += 1
+    
+    # Remove very old objects (older than 10 frames)
+    detected_objects = [obj for obj in detected_objects if obj['age'] < 10]
+    
+    # Estimate distances for new detections
+    estimates = depth_estimator.estimate_all_objects(objects, image_width)
+    
+    for estimate in estimates:
+        obj = estimate['object']
+        distance = estimate['distance']
+        confidence = estimate['confidence']
+        
+        if distance is not None:
+            # Calculate object position relative to robot
+            # If we don't have good confidence, place at edge of range (5m)
+            if confidence < 0.5:
+                distance = 5.0  # Place at border
+            
+            # Object is in direction of where it appears in frame
+            # Center position -> straight ahead
+            # Left position -> slightly left of robot angle
+            # Right position -> slightly right of robot angle
+            
+            angle_offset = 0
+            if obj['position'] == 'left':
+                angle_offset = 20  # 20 degrees left
+            elif obj['position'] == 'right':
+                angle_offset = -20  # 20 degrees right
+            
+            obj_angle = robot_angle + angle_offset
+            obj_x = robot_x + distance * np.cos(np.radians(obj_angle))
+            obj_y = robot_y + distance * np.sin(np.radians(obj_angle))
+            
+            # Add to detected objects
+            detected_objects.append({
+                'x': obj_x,
+                'y': obj_y,
+                'class': obj['class'],
+                'age': 0,
+                'confidence': confidence
+            })
+
+
 def setup_live_plot():
     """Setup matplotlib figure for live robot tracking"""
     plt.ion()  # Interactive mode
@@ -281,10 +342,24 @@ def update_plot(ax):
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
     
-    # Plot obstacles detected by ultrasonic sensor
+    # Plot detected objects with fading (vision-based)
+    for obj in detected_objects:
+        # Calculate alpha (transparency) based on age - newer = more opaque
+        alpha = max(0.2, 1.0 - (obj['age'] / 10.0))
+        
+        # Chair is green, others are black
+        color = 'green' if obj['class'] == 'chair' else 'black'
+        marker = 's' if obj['class'] == 'chair' else 'o'  # square for chair, circle for others
+        size = 150 if obj['class'] == 'chair' else 80
+        
+        ax.scatter(obj['x'], obj['y'], c=color, marker=marker, s=size, 
+                  alpha=alpha, edgecolors='white', linewidths=1.5, zorder=4,
+                  label=f"{obj['class']}" if obj['age'] == 0 else "")
+    
+    # Plot obstacles detected by ultrasonic sensor (red X)
     if len(obstacle_x) > 0:
         ax.scatter(obstacle_x, obstacle_y, c='red', marker='x', s=100, linewidths=3, 
-                  label=f'Obstacles ({len(obstacle_x)})', zorder=5)
+                  label=f'Ultrasonic obstacles ({len(obstacle_x)})', zorder=5)
     
     # Plot path
     if len(path_x) > 1:
@@ -297,6 +372,15 @@ def update_plot(ax):
     arrow_length = 0.15
     dx = arrow_length * np.cos(np.radians(robot_angle))
     dy = arrow_length * np.sin(np.radians(robot_angle))
+    ax.arrow(robot_x, robot_y, dx, dy, head_width=0.08, head_length=0.08, fc='red', ec='red')
+    
+    # Only show legend for unique labels
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=8)
+    
+    plt.draw()
+    plt.pause(0.001)  # Very short pause to update display
     ax.arrow(robot_x, robot_y, dx, dy, head_width=0.08, head_length=0.08, fc='red', ec='red')
     
     ax.legend()
@@ -422,6 +506,15 @@ def run_navigation_loop(sock, model,stop_n_think):
 
             # Navigate using YOLO - looking for chair
             try:
+                # First, detect objects for marking on map
+                from utils.detection_utils import detect_objects_yolo
+                objects, annotated_img = detect_objects_yolo(img, model)
+                
+                # Mark detected objects on the map
+                height, width = img.shape[:2]
+                mark_detected_objects(objects, width)
+                
+                # Now navigate
                 result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None)
                 
                 # Update position estimate based on navigation result

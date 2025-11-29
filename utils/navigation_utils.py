@@ -123,6 +123,20 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
             # Find largest target object
             target = max(target_objects, key=lambda x: x['area'])
             
+            # Check for obstacles in the way (objects that are not the target)
+            other_objects = [obj for obj in objects if obj['class'] != target_class]
+            
+            # If there are other objects blocking the path, avoid them first
+            if other_objects:
+                blocking_objects = [obj for obj in other_objects 
+                                  if obj['area'] > width * height * 0.15 and obj['position'] == 'center']
+                if blocking_objects:
+                    blocker = max(blocking_objects, key=lambda x: x['area'])
+                    logger.warning(f"⚠️ {blocker['class']} blocking path to {target_class}! Avoiding...")
+                    logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
+                    cmd(sock, 'move', where='right', at=60)
+                    return 'avoid_blocker'
+            
             # Navigate toward target
             if target['position'] == 'center':
                 # Check if close enough (object is large)
