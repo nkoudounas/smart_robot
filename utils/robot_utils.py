@@ -79,6 +79,19 @@ def cmd(sock, do, what='', where='', at=''):
     elif do == 'stop':
         msg.update({"N": 1, "D1": 0, "D2": 0, "D3": 1})
         what = ' car'
+    elif do == 'rotate':
+        msg.update({"N": 5, "D1": 1, "D2": at})  # at is angle here
+        what = ' ultrasonic unit'
+        where = ' '
+    elif do == 'measure':
+        if what == 'distance':
+            msg.update({"N": 21, "D1": 2})
+        elif what == 'motion':
+            msg["N"] = 6
+        what = ' ' + what
+    elif do == 'check':
+        msg["N"] = 23
+        what = ' off the ground'
     
     msg_json = json.dumps(msg)
     print(str(cmd_no) + ': ' + do + what + where + str(at), end=': ')
@@ -183,3 +196,26 @@ def reconnect_robot(sock):
     except Exception as e:
         print(f"✗ Failed: {e}")
         return None
+
+
+def read_distance(sock):
+    """Read ultrasonic distance sensor (returns distance in cm). Uses 1 command."""
+    result = cmd(sock, 'measure', what='distance')
+    if result is not None and isinstance(result, int):
+        return result
+    return None
+
+
+def rotate_sensor(sock, angle):
+    """Rotate ultrasonic sensor to specified angle (-90 to 90). Uses 1 command."""
+    result = cmd(sock, 'rotate', at=angle)
+    return result
+
+
+def read_ir_sensors(sock):
+    """Read IR line sensors - checks if robot is off the ground or at edge. Uses 1 command."""
+    result = cmd(sock, 'check')
+    if result is not None:
+        # Result: 1 = on ground, 0 = off ground/edge detected
+        return result
+    return None

@@ -11,13 +11,12 @@ import struct
 import time
 
 # Import robot utility functions
-from robot_utils import capture, cmd, check_connection, setup_socket_options, reconnect_robot
+from utils.robot_utils import capture, cmd, check_connection, setup_socket_options, reconnect_robot
 
 # Import detection utility functions
-from detection_utils import (
+from utils.detection_utils import (
     initialize_yolo_model, 
-    detect_objects_yolo, 
-    detect_objects_color,
+    detect_objects_yolo,
     get_largest_object
 )
 
@@ -101,78 +100,6 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
                 return 'avoid_left'
         else:
             # Obstacles far enough, can move forward
-            print("Path clear, moving forward")
-            cmd(sock, 'move', where='forward', at=60)
-            return 'forward'
-    
-    return 'idle'
-
-
-def navigate_with_color_detection(sock, img, target_color=None, avoid_obstacles=True):
-    """
-    Navigate the robot based on color detection.
-    - target_color: 'red', 'green', or 'blue' to follow a specific color
-    - avoid_obstacles: if True, avoid detected objects; if False, move toward target
-    """
-    objects, annotated_img = detect_objects_color(img)
-    cv.imshow('Camera', annotated_img)
-    cv.waitKey(1)
-    
-    height, width = annotated_img.shape[:2]
-    
-    if len(objects) == 0:
-        # No objects detected, move forward slowly
-        print("No objects detected, moving forward")
-        cmd(sock, 'move', where='forward', at=50)
-        return 'forward'
-    
-    # Filter for target color if specified
-    if target_color:
-        target_objects = [obj for obj in objects if obj['color'] == target_color]
-        if target_objects:
-            # Find largest target object
-            target = max(target_objects, key=lambda x: x['area'])
-            
-            # Navigate toward target
-            if target['position'] == 'center':
-                # Check if close enough (object is large)
-                if target['area'] > width * height * 0.3:
-                    print(f"Reached {target_color} target, stopping")
-                    cmd(sock, 'stop')
-                    return 'reached'
-                else:
-                    print(f"Target {target_color} centered, moving forward")
-                    cmd(sock, 'move', where='forward', at=60)
-                    return 'forward'
-            elif target['position'] == 'left':
-                print(f"Target {target_color} on left, turning left")
-                cmd(sock, 'move', where='left', at=50)
-                return 'left'
-            else:  # right
-                print(f"Target {target_color} on right, turning right")
-                cmd(sock, 'move', where='right', at=50)
-                return 'right'
-    
-    if avoid_obstacles:
-        # Avoid obstacles - find largest obstacle
-        obstacle = get_largest_object(objects)
-        
-        # If obstacle is too close (large area), take action
-        if obstacle['area'] > width * height * 0.2:
-            if obstacle['position'] == 'center':
-                print("Obstacle ahead, turning right")
-                cmd(sock, 'move', where='right', at=60)
-                return 'avoid_right'
-            elif obstacle['position'] == 'left':
-                print("Obstacle on left, turning right")
-                cmd(sock, 'move', where='right', at=50)
-                return 'avoid_right'
-            else:  # right
-                print("Obstacle on right, turning left")
-                cmd(sock, 'move', where='left', at=50)
-                return 'avoid_left'
-        else:
-            # Obstacle far enough, can move forward
             print("Path clear, moving forward")
             cmd(sock, 'move', where='forward', at=60)
             return 'forward'
@@ -436,7 +363,7 @@ def run_navigation_loop(sock, model):
 def main():
     """Main entry point"""
     # Initialize YOLO model
-    model = initialize_yolo_model('yolov8n.pt')
+    model = initialize_yolo_model('yolov8s.pt')
     
     # Connect to robot
     sock = connect_to_robot()
