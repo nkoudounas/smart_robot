@@ -10,6 +10,10 @@ import sys
 import struct
 import time
 import colorlog
+import matplotlib
+matplotlib.use('TkAgg')  # Use interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 # Setup colored logging
 logger = colorlog.getLogger()
@@ -44,6 +48,14 @@ from utils.navigation_utils import navigate_with_yolo, thinking_mode
 iteration_count = 0
 paused = False
 manual_mode = False
+
+# Robot position tracking (2D estimated position)
+robot_x = 0.0
+robot_y = 0.0
+robot_angle = 90.0  # degrees, 0=right, 90=up, 180=left, 270=down
+path_x = [0.0]
+path_y = [0.0]
+last_command = None
 
 
 def connect_to_robot():
@@ -175,6 +187,93 @@ def handle_keyboard_input(sock):
     return None
 
 
+def update_robot_position(command, duration=0.5):
+    """
+    Update estimated robot position based on command.
+    Simple dead-reckoning estimation.
+    """
+    global robot_x, robot_y, robot_angle, path_x, path_y, last_command
+    
+    last_command = command
+    
+    if command == 'forward':
+        # Move forward in current direction (estimate ~20cm per 0.5s)
+        distance = 0.20 * (duration / 0.5)
+        robot_x += distance * np.cos(np.radians(robot_angle))
+        robot_y += distance * np.sin(np.radians(robot_angle))
+    elif command == 'back':
+        # Move backward
+        distance = 0.20 * (duration / 0.5)
+        robot_x -= distance * np.cos(np.radians(robot_angle))
+        robot_y -= distance * np.sin(np.radians(robot_angle))
+    elif command == 'left':
+        # Rotate left (estimate ~45 degrees per 0.5s)
+        robot_angle += 45 * (duration / 0.5)
+        robot_angle %= 360
+    elif command == 'right':
+        # Rotate right
+        robot_angle -= 45 * (duration / 0.5)
+        robot_angle %= 360
+    
+    # Record path
+    path_x.append(robot_x)
+    path_y.append(robot_y)
+
+
+def setup_live_plot():
+    """Setup matplotlib figure for live robot tracking"""
+    plt.ion()  # Interactive mode
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
+    ax.set_xlabel('X (meters)')
+    ax.set_ylabel('Y (meters)')
+    ax.set_title('Robot Movement (Estimated)')
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    
+    # Position the window
+    mngr = plt.get_current_fig_manager()
+    try:
+        mngr.window.wm_geometry("+850+0")  # Position to right of camera window
+    except:
+        pass
+    
+    plt.show(block=False)
+    plt.pause(0.1)
+    
+    return fig, ax
+
+
+def update_plot(ax):
+    """Update the live plot with current robot position"""
+    ax.clear()
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
+    ax.set_xlabel('X (meters)')
+    ax.set_ylabel('Y (meters)')
+    ax.set_title(f'Robot Movement - Angle: {robot_angle:.0f}° - Last: {last_command}')
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    
+    # Plot path
+    if len(path_x) > 1:
+        ax.plot(path_x, path_y, 'b-', alpha=0.5, linewidth=2, label='Path')
+    
+    # Plot robot position with direction arrow
+    ax.plot(robot_x, robot_y, 'ro', markersize=10, label='Robot')
+    
+    # Draw direction arrow
+    arrow_length = 0.15
+    dx = arrow_length * np.cos(np.radians(robot_angle))
+    dy = arrow_length * np.sin(np.radians(robot_angle))
+    ax.arrow(robot_x, robot_y, dx, dy, head_width=0.08, head_length=0.08, fc='red', ec='red')
+    
+    ax.legend()
+    plt.draw()
+    plt.pause(0.001)  # Very short pause to update display
+
+
 def periodic_reconnect(sock, iteration,stop_n_think = False):
     """
     Perform periodic reconnection to prevent robot firmware timeout.
@@ -193,7 +292,7 @@ def periodic_reconnect(sock, iteration,stop_n_think = False):
         if stop_n_think:
             # Now do maintenance with fresh connection - check if thinking mode needed
             try:
-                thinking_activated = thinking_mode(sock)
+                thinking_activated, movements = thinking_mode(sock)
                 if not thinking_activated:
                     # Distance was safe, just stop
                     cmd(sock, 'stop')
@@ -229,6 +328,10 @@ def run_navigation_loop(sock, model,stop_n_think):
     cv.resizeWindow('Camera', 800, 600)
     cv.moveWindow('Camera', 0, 0)
     
+    # Setup live plot
+    fig, ax = setup_live_plot()
+    update_plot(ax)  # Draw initial plot
+    
     iteration_count = 0
     
     try:
@@ -246,6 +349,7 @@ def run_navigation_loop(sock, model,stop_n_think):
             # Skip iteration if paused
             if paused:
                 time.sleep(0.1)
+                update_plot(ax)  # Keep plot responsive
                 continue
             
             # Check connection
@@ -275,9 +379,23 @@ def run_navigation_loop(sock, model,stop_n_think):
                 time.sleep(0.5)
                 continue
             
-            # Navigate using YOLO
+            # Navigate using YOLO - looking for chair
             try:
-                result = navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None)
+                result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None)
+                
+                # Update position estimate based on navigation result
+                if result and result != 'idle':
+                    if result in ['forward', 'back']:
+                        update_robot_position(result, duration=0.3)
+                    elif result in ['left', 'right', 'avoid_left', 'avoid_right']:
+                        cmd_type = result.replace('avoid_', '')
+                        update_robot_position(cmd_type, duration=0.3)
+                    elif result == 'searching':
+                        update_robot_position('right', duration=0.3)
+                
+                # Update live plot
+                update_plot(ax)
+                
             except Exception as e:
                 logger.error(f"\n!!! ERROR in navigation at iteration {iteration_count}: {e}")
                 result = None
@@ -314,6 +432,7 @@ def run_navigation_loop(sock, model,stop_n_think):
     finally:
         sock.close()
         cv.destroyAllWindows()
+        plt.close('all')
     
     return iteration_count
 
@@ -334,5 +453,5 @@ def main(stop_n_think):
 
 
 if __name__ == '__main__':
-    stop_n_think = False
+    stop_n_think = True
     main(stop_n_think)
