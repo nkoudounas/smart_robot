@@ -17,7 +17,7 @@ def capture():
     """Capture image from robot camera (HTTP, not socket command)"""
     global cmd_no
     cmd_no += 1
-    print(f"cmd_no: {str(cmd_no)}" + ': capture image', end=' ')
+    print("\n" + f"\033[94m{str(cmd_no)}: capture image (http)\033[0m", end=' ')
     
     max_retries = 3
     for attempt in range(max_retries):
@@ -33,7 +33,7 @@ def capture():
                     time.sleep(0.5)
                     continue
                 return None
-            print(f'[OK: {img.shape}]')
+            print(f'\033[94m[OK: {img.shape}]\033[0m')
             return img
         except Exception as e:
             if attempt < max_retries - 1:
@@ -94,11 +94,29 @@ def cmd(sock, do, what='', where='', at=''):
         what = ' off the ground'
     
     msg_json = json.dumps(msg)
-    print(str(cmd_no) + ': ' + do + what + where + str(at), end=': ')
+    
+    # Color code based on command type
+    if do == 'move':
+        if where.strip() == 'forward':
+            color = '\033[92m'  # Green
+        elif where.strip() == 'back':
+            color = '\033[93m'  # Yellow
+        elif where.strip() == 'left':
+            color = '\033[95m'  # Magenta
+        elif where.strip() == 'right':
+            color = '\033[96m'  # Cyan
+        else:
+            color = '\033[97m'  # White
+    elif do == 'stop':
+        color = '\033[91m'  # Red
+    else:
+        color = '\033[97m'  # White
+    
+    print(f"{color}{cmd_no}: {do}{what}{where}{at}\033[0m", end=': ')
     
     try:
         sock.send(msg_json.encode())
-        print("[SENT]", end=' ')
+        print(f"{color}[SENT]\033[0m", end=' ')
     except socket.error as e:
         print(f'\nERROR sending command: {e}')
         return None
@@ -128,7 +146,7 @@ def cmd(sock, do, what='', where='', at=''):
             response_buffer += chunk
             
             if '_' in response_buffer:
-                print(f"[RECV: {len(response_buffer)} bytes]", end=' ')
+                print(f"{color}[RECV: {len(response_buffer)} bytes]\033[0m", end=' ')
                 break
         
         res = response_buffer
@@ -150,7 +168,7 @@ def cmd(sock, do, what='', where='', at=''):
         res = 0
     else:
         res = int(res)
-    print(res)
+    print(f"{color}{res}\033[0m")
     return res
 
 def setup_socket_options(socket_obj):

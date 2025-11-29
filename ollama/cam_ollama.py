@@ -14,7 +14,7 @@ from robot_utils import (
 )
 
 # Import Ollama vision functions
-from ollama_vision import (
+from ollama.ollama_vision import (
     query_ollama_vision, parse_ollama_decision,
     check_ollama_connection
 )

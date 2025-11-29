@@ -3,8 +3,8 @@ Navigation functions for robot movement and obstacle avoidance
 """
 
 import cv2 as cv
-from .detection_utils import detect_objects_yolo, get_largest_object
-from .robot_utils import cmd, read_distance
+from ..utils.detection_utils import detect_objects_yolo, get_largest_object
+from ..utils.robot_utils import cmd, read_distance
 
 
 def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):

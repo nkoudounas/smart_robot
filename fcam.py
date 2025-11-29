@@ -267,7 +267,7 @@ def periodic_reconnect(sock, iteration):
     Robot firmware closes connection after 8 commands.
     Returns: new socket or None if failed
     """
-    if iteration % 3 == 0 and iteration > 0:
+    if iteration % 4 == 0 and iteration > 0:
         logger.warning("\n[Periodic maintenance: reconnecting before robot limit]")
         try:
             cmd(sock, 'stop')
