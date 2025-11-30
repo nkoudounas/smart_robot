@@ -2,6 +2,10 @@
 *.pt
 yolov8*.pt
 videos/*
+
+# Old code (keep locally but don't commit)
+old_cams/
+ElegooRobotCarV4/
 # Python cache
 __pycache__/
 *.pyc
@@ -14,6 +18,13 @@ __pycache__/
 venv/
 env/
 ENV/
+# Environment variables 
+.env
+.env.local
+
+# Video outputs
+*.mp4
+*.avi
 
 # IDE
 .vscode/

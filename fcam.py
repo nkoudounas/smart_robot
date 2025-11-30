@@ -436,9 +436,11 @@ def update_plot(ax, target='chair'):
     plt.pause(0.001)  # Very short pause to update display
 
 
-def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
+def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capture_video=True):
     """
     Main navigation loop with YOLO object detection.
+    Args:
+        capture_video: If True, record navigation video with logs (default: True)
     Returns: final iteration count
     """
     # target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
@@ -514,13 +516,17 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                 time.sleep(0.5)
                 continue
             
-            # Initialize video logger on first successful frame capture
-            if not video_initialized:
+            # Initialize video logger on first successful frame capture (if enabled)
+            if not video_initialized and capture_video:
                 video_logger = VideoLogger(fps=2.0, frame_width=640, frame_height=480)
                 video_logger.start_recording()
                 video_logger.add_log("Navigation started", "INFO")
                 logger.info("📹 Video recording auto-started")
                 video_initialized = True
+            elif not video_initialized and not capture_video:
+                # Mark as initialized even if not capturing video
+                video_initialized = True
+                logger.info("📹 Video recording disabled")
 
             # Check if robot is stuck (same view for multiple frames)
             if is_robot_stuck(img):
@@ -830,7 +836,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
     return iteration_count
 
 
-def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False):
+def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False, capture_video=True):
     """Main entry point
     
     Args:
@@ -838,6 +844,7 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
         ai_decide: If True, use AI (Ollama/Gemini) for decision making in YOLO navigation
         target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
         use_segmentation: If True, use YOLO segmentation model (yolo11l-seg.pt)
+        capture_video: If True, record navigation video with logs (default: True)
     """
     # Initialize YOLO model - use segmentation if requested
     if use_segmentation:
@@ -851,7 +858,7 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
     sock = connect_to_robot()
     
     # Run navigation loop
-    final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide, target)
+    final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide, target, capture_video=capture_video)
     
     logger.info(f"\nTotal iterations completed: {final_iterations}")
     logger.info("Program ended")
@@ -862,4 +869,5 @@ if __name__ == '__main__':
     ai_decide =  True    # NEW: Use AI for decision making with YOLO detection
     target = 'chair'     # Target object class to search for
     use_segmentation = True  # Use YOLO segmentation model for better object understanding
-    main(use_ollama, ai_decide, target, use_segmentation)
+    capture_video = True  # Record navigation video with logs
+    main(use_ollama, ai_decide, target, use_segmentation, capture_video)
