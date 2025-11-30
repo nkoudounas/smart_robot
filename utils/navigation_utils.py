@@ -53,7 +53,7 @@ def parse_ai_movement_response(response):
         return 'stop', 0, 0
 
 
-def ai_navigation_decision(annotated_img, target, other_objects, target_class, img_width, img_height):
+def ai_navigation_decision(annotated_img, target, other_objects, target_class, img_width, img_height, decision_history=None):
     """
     Use AI (Ollama/Gemini) to decide robot movement based on detected objects.
     
@@ -64,6 +64,7 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
         target_class: Name of target class (e.g., 'chair')
         img_width: Image width in pixels
         img_height: Image height in pixels
+        decision_history: List of recent AI decisions (for context)
     
     Returns:
         tuple: (decision: str, speed: int, duration: float)
@@ -82,12 +83,25 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
         obstacles_info = f"\nObstacles detected: {len(other_objects)} objects - "
         obstacles_info += ", ".join([f"{obj['class']} ({obj['position']})" for obj in other_objects[:3]])
     
+    # Build decision history context
+    history_info = ""
+    if decision_history and len(decision_history) > 0:
+        history_info = "\n\nRecent actions (newest last):\n"
+        for i, dec in enumerate(decision_history[-3:], 1):  # Show last 3
+            history_info += f"{i}. Action: {dec['decision']} (speed={dec['speed']}, {dec['duration']:.1f}s)\n"
+            history_info += f"   Target was: {dec['target_position']} (area={dec.get('target_area', 0):.0f}px²)\n"
+            if dec.get('all_objects'):
+                history_info += f"   Objects seen: "
+                history_info += ", ".join([f"{obj['class']}@{obj['position']}({obj['area']:.0f}px²)" for obj in dec['all_objects'][:4]])
+                history_info += "\n"
+        history_info += "\nAnalyze: Are you making progress? Is target getting larger/more centered? Try different approach if stuck!"
+    
     prompt = f"""You are controlling a robot car. This image shows detected objects with bounding boxes.
 
 Your GOAL: Navigate toward the {target_class} (shown in GREEN bounding box).
 
 Current situation:
-{target_info}{obstacles_info}
+{target_info}{obstacles_info}{history_info}
 
 Instructions:
 1. The GREEN box shows your target {target_class}
@@ -105,13 +119,12 @@ Examples:
 Decision rules:
 - If target is LARGE and centered: "stop 0 0"
 - If target is centered but MEDIUM/FAR: "forward 80 1.5" or "forward 100 2.0" (faster/longer if far)
-- If target is on the LEFT and CLOSE: "left 60 0.8"
-- If target is on the LEFT and FAR: "forward 90 1.5" (move forward toward it)
-- If target is on the RIGHT and CLOSE: "right 60 0.8"
-- If target is on the RIGHT and FAR: "forward 90 1.5" (move forward toward it)
+- If target is on the LEFT (any distance): "left 60 1.0" (turn left to face it)
+- If target is on the RIGHT (any distance): "right 60 1.0" (turn right to face it)
 - If obstacles block path: "right 70 0.8" (quick dodge)
 
-IMPORTANT: Forward movements MUST use at least 1.0 second duration (preferably 1.5-2.0s)
+IMPORTANT: Always turn toward the target if it's not centered!
+Forward movements MUST use at least 1.0 second duration (preferably 1.5-2.0s)
 Speed range: 40-100 (higher = faster)
 Duration range: 0.5-1.0s for turns, 1.0-2.5s for forward movements"""
 
@@ -129,7 +142,7 @@ Duration range: 0.5-1.0s for turns, 1.0-2.5s for forward movements"""
     return decision, speed, duration
 
 
-def ai_search_decision(annotated_img, target_class, other_objects, img_width, img_height):
+def ai_search_decision(annotated_img, target_class, other_objects, img_width, img_height, decision_history=None):
     """
     Use AI to decide search strategy when target is not detected.
     
@@ -139,6 +152,7 @@ def ai_search_decision(annotated_img, target_class, other_objects, img_width, im
         other_objects: List of detected objects (not the target)
         img_width: Image width in pixels
         img_height: Image height in pixels
+        decision_history: List of recent AI decisions (for context)
     
     Returns:
         tuple: (decision: str, speed: int, duration: float)
@@ -154,10 +168,20 @@ def ai_search_decision(annotated_img, target_class, other_objects, img_width, im
         obstacles_info = f"\nOther objects visible: {len(other_objects)} - "
         obstacles_info += ", ".join([f"{obj['class']}" for obj in other_objects[:3]])
     
+    # Build decision history context
+    history_info = ""
+    if decision_history and len(decision_history) > 0:
+        history_info = "\n\nRecent search actions:\n"
+        for i, dec in enumerate(decision_history[-3:], 1):
+            history_info += f"{i}. {dec['decision']} ({dec['duration']:.1f}s)\n"
+            if dec.get('all_objects'):
+                history_info += f"   Saw: {', '.join([obj['class'] for obj in dec['all_objects'][:3]])}\n"
+        history_info += "\nVary your search pattern if not finding the target!"
+    
     prompt = f"""You are controlling a robot car searching for a {target_class}.
 
 Current situation:
-- Target {target_class} is NOT visible in the image{obstacles_info}
+- Target {target_class} is NOT visible in current view{obstacles_info}{history_info}
 
 Respond with EXACTLY this format: <decision> <speed> <duration>
 
@@ -456,6 +480,80 @@ def ultrasonic_safety_check(sock, threshold=30):
     return True, distance  # Safe to proceed
 
 
+def smart_search_for_target(sock, img, model, target_class, capture_callback):
+    """
+    Intelligently search for target by scanning left, center, right with camera rotation.
+    Then moves robot based on where target was found.
+    
+    Args:
+        sock: Robot socket connection
+        img: Current image
+        model: YOLO model
+        target_class: Target class to search for
+        capture_callback: Function to capture new frame after rotation
+        
+    Returns:
+        str: 'left', 'right', 'center', or None
+    """
+    logger.info(f"🔍 Smart search: scanning for {target_class}...")
+    
+    # Rotate camera to left (150°) and check
+    logger.debug("Scanning left (150°)...")
+    cmd(sock, 'rotate', at=150)
+    time.sleep(0.5)  # Wait for servo to rotate
+    
+    left_img = capture_callback()
+    chair_on_left = False
+    if left_img is not None:
+        objects, _ = detect_objects_yolo(left_img, model, target_class=target_class)
+        target_objects = [obj for obj in objects if obj['class'] == target_class]
+        if target_objects:
+            logger.info(f"✓ Target {target_class} found on LEFT!")
+            chair_on_left = True
+    
+    # Rotate camera to right (30°) and check
+    logger.debug("Scanning right (30°)...")
+    cmd(sock, 'rotate', at=30)
+    time.sleep(0.5)  # Wait for servo to rotate
+    
+    right_img = capture_callback()
+    chair_on_right = False
+    if right_img is not None:
+        objects, _ = detect_objects_yolo(right_img, model, target_class=target_class)
+        target_objects = [obj for obj in objects if obj['class'] == target_class]
+        if target_objects:
+            logger.info(f"✓ Target {target_class} found on RIGHT!")
+            chair_on_right = True
+    
+    # Always return camera to center (90°) - MANDATORY
+    logger.debug("Returning camera to center (90°)...")
+    cmd(sock, 'rotate', at=90)
+    time.sleep(0.5)
+    
+    # Decide robot movement based on scan results
+    if chair_on_left:
+        logger.info("Smart search: chair on left, turning robot left")
+        cmd(sock, 'move', where='left', at=movement_speed('left_normal'))
+        return 'left'
+    elif chair_on_right:
+        logger.info("Smart search: chair on right, turning robot right")
+        cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
+        return 'right'
+    else:
+        # No chair found - check center view
+        center_img = capture_callback()
+        if center_img is not None:
+            objects, _ = detect_objects_yolo(center_img, model, target_class=target_class)
+            target_objects = [obj for obj in objects if obj['class'] == target_class]
+            if target_objects:
+                logger.info(f"✓ Target {target_class} found in CENTER!")
+                return 'center'
+        
+        # Not found anywhere
+        logger.warning(f"✗ Target {target_class} not found in any direction")
+        return None
+
+
 def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None):
     """
     Navigate the robot based on YOLO object detection.
@@ -617,7 +715,11 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                     cmd(sock, 'move', where='right', at=speed)
                     return ('right', duration)
         else:
-            # Target not found, search by rotating
+            # Target not found - use smart search
+            logger.warning(f"Target {target_class} not in current view")
+            
+            # Smart search is handled in fcam.py to have access to capture callback
+            # Just return searching action here
             logger.warning(f"Searching for {target_class}...")
             cmd(sock, 'move', where='right', at=movement_speed('right_search'))
             return ('searching', MOVEMENT_DELAYS['right'])

@@ -77,6 +77,10 @@ stuck_counter = 0
 STUCK_THRESHOLD = 3  # Number of similar frames before considering stuck
 PIXEL_DIFF_THRESHOLD = 0.02  # 2% pixel difference threshold
 
+# AI decision memory (track last N decisions)
+ai_decision_history = []
+AI_MEMORY_SIZE = 5  # Keep last 5 decisions
+
 
 def print_controls():
     """Print keyboard control instructions"""
@@ -576,35 +580,97 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide):
                     
                     # If AI decision mode is enabled, compute decision BEFORE calling navigate
                     ai_decision = None
+                    target_objects = [obj for obj in objects if obj['class'] == 'chair']
+                    
                     if ai_decide:
-                        # Reconnect before AI call to ensure fresh connection after AI finishes
-                        # (AI takes 2-5+ seconds, robot firmware might close idle connection)
-                        logger.debug("Reconnecting before AI decision call...")
-                        sock = reconnect_robot(sock)
-                        if sock is None:
-                            logger.error("Failed to reconnect before AI decision")
-                            paused = True
-                            continue
-                        
-                        # Find target and compute AI decision while socket is idle
-                        target_objects = [obj for obj in objects if obj['class'] == 'chair']
+                        # Find target and compute AI decision
                         if target_objects:
                             target = max(target_objects, key=lambda x: x['area'])
                             other_objects = [obj for obj in objects if obj['class'] != 'chair']
                             
                             # Call AI decision function (takes 5+ seconds)
                             from utils.navigation_utils import ai_navigation_decision
-                            ai_decision = ai_navigation_decision(annotated_img, target, other_objects, 'chair', width, height)
+                            ai_decision = ai_navigation_decision(annotated_img, target, other_objects, 'chair', width, height, ai_decision_history)
                         else:
-                            # No target found - AI can still decide (search, explore, etc.)
-                            logger.info("No chair detected, querying AI for search strategy...")
-                            from utils.navigation_utils import ai_search_decision
-                            ai_decision = ai_search_decision(annotated_img, 'chair', objects, width, height)
+                            # No target found - use smart search instead of AI search
+                            logger.info("No chair detected, will use smart search...")
+                            ai_decision = None  # Don't use AI for search, use smart search instead
+                        
+                        # Reconnect AFTER AI finishes (before sending movement command)
+                        # Robot may have closed connection during long AI processing
+                        if ai_decision:  # Only reconnect if AI was actually called
+                            logger.debug("Reconnecting after AI decision (before sending command)...")
+                            sock = reconnect_robot(sock)
+                            if sock is None:
+                                logger.error("Failed to reconnect after AI decision")
+                                paused = True
+                                continue
                     
                     # Now navigate with YOLO (with pre-computed AI decision if enabled)
                     result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None, 
                                               ai_decide=ai_decide, ai_decision=ai_decision,
                                               objects=objects, annotated_img=annotated_img)
+                    
+                    # If searching (no target found), use smart search
+                    if result and result[0] == 'searching':
+                        logger.info("🔍 Initiating smart search...")
+                        from utils.navigation_utils import smart_search_for_target
+                        
+                        # Smart search will rotate and check directions
+                        direction = smart_search_for_target(sock, img, model, 'chair', capture)
+                        
+                        if direction == 'left':
+                            # Chair found on left, stay there
+                            logger.info("Smart search: turning toward chair on left")
+                            result = ('left', movement_delay('left'))
+                        elif direction == 'right':
+                            # Chair found on right, already positioned
+                            logger.info("Smart search: turning toward chair on right")
+                            result = ('right', movement_delay('right'))
+                        elif direction == 'center':
+                            # Chair in center, move forward
+                            logger.info("Smart search: chair centered, moving forward")
+                            result = ('forward', movement_delay('forward'))
+                        else:
+                            # Not found anywhere, continue random search
+                            logger.warning("Smart search: chair not found, continuing random search")
+                            cmd(sock, 'move', where='right', at=movement_speed('right_search'))
+                            result = ('searching', movement_delay('right'))
+                        
+                        # Reconnect after smart search movements
+                        sock = reconnect_robot(sock)
+                        if sock is None:
+                            logger.error("Failed to reconnect after smart search")
+                            paused = True
+                            continue
+                    
+                    # Store AI decision in history if AI mode is enabled
+                    if ai_decide and ai_decision:
+                        decision_str, speed, duration = ai_decision
+                        target_pos = target_objects[0]['position'] if target_objects else 'none'
+                        target_area = target_objects[0]['area'] if target_objects else 0
+                        
+                        # Store full object information for each detected object
+                        objects_snapshot = []
+                        for obj in objects:
+                            objects_snapshot.append({
+                                'class': obj['class'],
+                                'position': obj['position'],
+                                'area': obj['area'],
+                                'confidence': obj['confidence']
+                            })
+                        
+                        ai_decision_history.append({
+                            'decision': decision_str,
+                            'speed': speed,
+                            'duration': duration,
+                            'target_position': target_pos,
+                            'target_area': target_area,
+                            'all_objects': objects_snapshot
+                        })
+                        # Keep only last N decisions
+                        if len(ai_decision_history) > AI_MEMORY_SIZE:
+                            ai_decision_history.pop(0)
                     
                     # Extract duration from tuple (both AI and hardcoded modes return tuples now)
                     if isinstance(result, tuple):
@@ -729,5 +795,5 @@ def main(use_ollama=False, ai_decide=False):
 
 if __name__ == '__main__':
     use_ollama = False  # Deprecated: use full Ollama navigation
-    ai_decide = True    # NEW: Use AI for decision making with YOLO detection
+    ai_decide = False    # NEW: Use AI for decision making with YOLO detection
     main(use_ollama, ai_decide)
