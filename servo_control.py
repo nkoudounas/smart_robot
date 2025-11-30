@@ -9,7 +9,7 @@ import socket
 import sys
 import time
 import colorlog
-from utils.robot_utils import cmd, check_connection, setup_socket_options
+from utils.robot_utils import cmd, check_connection, setup_socket_options, reconnect_robot
 
 # Setup colored logging
 logger = colorlog.getLogger()
@@ -42,6 +42,23 @@ def connect_to_robot():
         logger.info("✓ Connected to robot successfully!")
         logger.info(f"Local address: {sock.getsockname()}")
         logger.info(f"Remote address: {sock.getpeername()}")
+        
+        # Wait for robot to settle after connection
+        time.sleep(0.5)
+        
+        # Clear any pending data in receive buffer
+        sock.setblocking(False)
+        try:
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                logger.debug(f"Cleared {len(data)} bytes from buffer")
+        except:
+            pass  # No more data to read
+        sock.setblocking(True)
+        sock.settimeout(10.0)
+        
         return sock
     except socket.timeout:
         logger.error("ERROR: Connection timeout. Is the robot powered on?")
@@ -51,25 +68,33 @@ def connect_to_robot():
         sys.exit(1)
 
 
-def reconnect_robot(sock):
-    """Reconnect to robot if connection lost"""
+def reconnect_with_buffer_clear(sock):
+    """
+    Reconnect to robot using robot_utils.reconnect_robot() 
+    and then clear the receive buffer
+    """
     try:
-        logger.warning("\n[Reconnecting to robot...]")
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-            sock.close()
-        except:
-            pass
+        # Use the proper reconnect from robot_utils (resets cmd counters)
+        new_sock = reconnect_robot(sock)  # This calls the imported function from robot_utils
+        if new_sock is None:
+            return None
         
+        # Wait for robot to settle
         time.sleep(0.5)
         
-        new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Clear any pending data in receive buffer
+        new_sock.setblocking(False)
+        try:
+            while True:
+                data = new_sock.recv(4096)
+                if not data:
+                    break
+                logger.debug(f"Cleared {len(data)} bytes from buffer")
+        except:
+            pass  # No more data to read
+        new_sock.setblocking(True)
         new_sock.settimeout(10.0)
-        new_sock.connect(('192.168.4.1', 100))
-        setup_socket_options(new_sock)
         
-        logger.info("✓ Reconnected")
-        time.sleep(0.3)
         return new_sock
     except Exception as e:
         logger.error(f"✗ Failed to reconnect: {e}")
@@ -88,6 +113,8 @@ def print_help():
     logger.info("  left            - Rotate servo left (60 degrees)")
     logger.info("  right           - Rotate servo right (-60 degrees)")
     logger.info("  scan            - Scan left to right")
+    logger.info("  distance        - Read ultrasonic distance sensor")
+    logger.info("  d               - Short form of distance")
     logger.info("  help            - Show this help message")
     logger.info("  quit / q        - Exit program")
     logger.info("="*50)
@@ -96,6 +123,7 @@ def print_help():
     logger.info("  > r -45")
     logger.info("  > center")
     logger.info("  > scan")
+    logger.info("  > distance")
     logger.info("="*50 + "\n")
 
 
@@ -129,16 +157,20 @@ def parse_command(user_input):
         return 'rotate', 60
     
     # Right command
-    if action in ['right', 'r'] and len(parts) == 1:
-        return 'rotate', -60
-    
     # Scan command
     if action in ['scan', 's']:
         return 'scan', None
     
+    # Distance command
+    if action in ['distance', 'd']:
+        return 'distance', None
+    
     # Rotate commands
     if action in ['rotate', 'r']:
         if len(parts) < 2:
+            logger.error("ERROR: rotate command requires an angle")
+            logger.info("Usage: rotate <angle>  (e.g., rotate 45)")
+            return None, None
             logger.error("ERROR: rotate command requires an angle")
             logger.info("Usage: rotate <angle>  (e.g., rotate 45)")
             return None, None
@@ -176,7 +208,7 @@ def execute_command(sock, action, value):
         # Check connection
         if not check_connection(sock):
             logger.error("Connection lost, attempting to reconnect...")
-            sock = reconnect_robot(sock)
+            sock = reconnect_with_buffer_clear(sock)
             if sock is None:
                 logger.error("Failed to reconnect. Exiting.")
                 return None, False
@@ -191,7 +223,7 @@ def execute_command(sock, action, value):
             logger.error("✗ Failed to rotate servo")
             # Try to reconnect
             logger.warning("Attempting to reconnect...")
-            sock = reconnect_robot(sock)
+            sock = reconnect_with_buffer_clear(sock)
             if sock is None:
                 logger.error("Failed to reconnect. Exiting.")
                 return None, False
@@ -204,7 +236,7 @@ def execute_command(sock, action, value):
         # Check connection
         if not check_connection(sock):
             logger.error("Connection lost, attempting to reconnect...")
-            sock = reconnect_robot(sock)
+            sock = reconnect_with_buffer_clear(sock)
             if sock is None:
                 logger.error("Failed to reconnect. Exiting.")
                 return None, False
@@ -220,6 +252,32 @@ def execute_command(sock, action, value):
             time.sleep(0.5)  # Wait for servo to move
         
         logger.info("✓ Scan complete")
+        return sock, True
+    
+    if action == 'distance':
+        # Check connection
+        if not check_connection(sock):
+            logger.error("Connection lost, attempting to reconnect...")
+            sock = reconnect_with_buffer_clear(sock)
+            if sock is None:
+                logger.error("Failed to reconnect. Exiting.")
+                return None, False
+        
+        # Read distance
+        logger.info("Reading ultrasonic distance sensor...")
+        result = cmd(sock, 'measure', what='distance')
+        
+        if result is not None and isinstance(result, int):
+            logger.info(f"✓ Distance: {result} cm")
+        else:
+            logger.error("✗ Failed to read distance sensor")
+            # Try to reconnect
+            logger.warning("Attempting to reconnect...")
+            sock = reconnect_with_buffer_clear(sock)
+            if sock is None:
+                logger.error("Failed to reconnect. Exiting.")
+                return None, False
+        
         return sock, True
     
     return sock, True
@@ -238,10 +296,9 @@ def main():
     # Print help
     print_help()
     
-    # Center servo on startup
-    logger.info("Centering servo...")
-    cmd(sock, 'rotate', at=0)
-    time.sleep(0.3)
+    # DON'T center servo on startup - let user control it
+    logger.info("Ready! Type commands (try 'center', 'rotate 45', or 'help')")
+    logger.info("Note: First command after connection may be slow\n")
     
     # Main loop
     try:

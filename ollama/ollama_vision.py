@@ -13,8 +13,8 @@ def encode_image_base64(img):
     img_base64 = base64.b64encode(buffer).decode('utf-8')
     return img_base64
 
-def query_ollama_vision(img, prompt, model="qwen3-vl:2b"):
-    """Send image and prompt to Ollama vision model"""
+def query_ollama_vision(img, prompt, model="gemma3:4b", enable_thinking=False):
+    """Send image and prompt to Ollama vision model with optional thinking process"""
     try:
         img_base64 = encode_image_base64(img)
         
@@ -26,15 +26,28 @@ def query_ollama_vision(img, prompt, model="qwen3-vl:2b"):
             "stream": False
         }
         
+        # Enable thinking parameter if supported by model (disabled by default for moondream)
+        if enable_thinking:
+            payload["think"] = True
+        
         print(f"Querying Ollama ({model})...", end=' ')
         start_time = time.time()
         
-        response = requests.post(url, json=payload, timeout=30)
+        response = requests.post(url, json=payload, timeout=60)  # Increased timeout for thinking
         
         if response.status_code == 200:
             result = response.json()
             elapsed = time.time() - start_time
             print(f"[OK: {elapsed:.1f}s]")
+            
+            # Print thinking process if available
+            if enable_thinking and 'thinking' in result:
+                print("\n" + "="*60)
+                print("🧠 OLLAMA THINKING PROCESS:")
+                print("="*60)
+                print(result['thinking'])
+                print("="*60 + "\n")
+            
             return result.get('response', '')
         else:
             print(f"[ERROR: {response.status_code}]")
@@ -81,9 +94,9 @@ def check_ollama_connection():
             model_names = [m['name'] for m in models]
             print(f"✓ Ollama is running with {len(models)} model(s): {', '.join(model_names)}")
             
-            if not any('qwen3-vl' in m for m in model_names):
-                print("\n⚠️  WARNING: qwen3-vl:2b not found!")
-                print("Run: ollama pull qwen3-vl:2b")
+            if not any('gemma3' in m for m in model_names):
+                print("\n⚠️  WARNING: gemma3:4b not found!")
+                print("Run: ollama pull gemma3:4b")
                 return False
             return True
         else:
@@ -92,5 +105,5 @@ def check_ollama_connection():
     except:
         print("⚠️  WARNING: Cannot connect to Ollama at localhost:11434")
         print("Make sure Ollama is running: ollama serve")
-        print("Then load model: ollama run qwen3-vl:2b")
+        print("Then load model: ollama run gemma3:4b")
         return False

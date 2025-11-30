@@ -5,6 +5,7 @@ Navigation functions for robot movement and obstacle avoidance
 import cv2 as cv
 import colorlog
 import time
+import re
 import numpy as np
 from .detection_utils import detect_objects_yolo, get_largest_object
 from .robot_utils import cmd, read_distance, read_ir_sensors
@@ -12,23 +13,209 @@ from .robot_utils import cmd, read_distance, read_ir_sensors
 # Setup logger
 logger = colorlog.getLogger(__name__)
 
+
+def parse_ai_movement_response(response):
+    """
+    Parse AI response in format: '<decision> <speed> <duration>'
+    
+    Args:
+        response: AI response string (e.g., "forward 80 1.5")
+    
+    Returns:
+        tuple: (decision: str, speed: int, duration: float)
+    """
+    # Extract decision, speed, duration using regex
+    pattern = r'(\w+)\s+(\d+)\s+([\d.]+)'
+    match = re.search(pattern, response.lower())
+    
+    if match:
+        decision = match.group(1)
+        speed = int(match.group(2))
+        duration = float(match.group(3))
+        
+        # Clamp speed to 0-100 range
+        speed = max(0, min(100, speed))
+        
+        # Clamp duration to 0.1-3.0 seconds
+        duration = max(0.1, min(3.0, duration))
+        
+        return decision, speed, duration
+    else:
+        # Fallback: try to extract just the decision word
+        words = response.lower().split()
+        for word in words:
+            if word in ['forward', 'left', 'right', 'stop', 'avoid', 'backward', 'rotate_left', 'rotate_right']:
+                logger.warning(f"AI response didn't match format, extracted '{word}' with defaults")
+                return word, 60, 1.0
+        
+        # Ultimate fallback
+        logger.error(f"Could not parse AI response: {response}")
+        return 'stop', 0, 0
+
+
+def ai_navigation_decision(annotated_img, target, other_objects, target_class, img_width, img_height):
+    """
+    Use AI (Ollama/Gemini) to decide robot movement based on detected objects.
+    
+    Args:
+        annotated_img: Image with bounding boxes drawn
+        target: Target object dict (with position, area, class, etc.)
+        other_objects: List of other detected objects (obstacles)
+        target_class: Name of target class (e.g., 'chair')
+        img_width: Image width in pixels
+        img_height: Image height in pixels
+    
+    Returns:
+        tuple: (decision: str, speed: int, duration: float)
+               decision: 'forward', 'left', 'right', 'stop', 'avoid'
+               speed: motor speed 0-100
+               duration: movement duration in seconds
+    """
+    # Import here to avoid circular dependency
+    from ollama.ollama_vision import query_ollama_vision
+    
+    # Build context prompt with object information
+    target_info = f"Target {target_class}: position={target['position']}, size={target['area']/(img_width*img_height)*100:.1f}% of image"
+    
+    obstacles_info = ""
+    if other_objects:
+        obstacles_info = f"\nObstacles detected: {len(other_objects)} objects - "
+        obstacles_info += ", ".join([f"{obj['class']} ({obj['position']})" for obj in other_objects[:3]])
+    
+    prompt = f"""You are controlling a robot car. This image shows detected objects with bounding boxes.
+
+Your GOAL: Navigate toward the {target_class} (shown in GREEN bounding box).
+
+Current situation:
+{target_info}{obstacles_info}
+
+Instructions:
+1. The GREEN box shows your target {target_class}
+2. Other colored boxes are obstacles to avoid
+3. Target position: {target['position']} (left/center/right of image)
+4. Target size: {'LARGE (close)' if target['area'] > img_width * img_height * 0.3 else 'MEDIUM (approaching)' if target['area'] > img_width * img_height * 0.15 else 'SMALL (far away)'}
+
+Respond with EXACTLY this format: <decision> <speed> <duration>
+
+Examples:
+- "forward 80 1.5" = move forward at speed 80 for 1.5 seconds
+- "left 60 1.0" = turn left at speed 60 for 1.0 seconds  
+- "stop 0 0" = stop (reached target)
+
+Decision rules:
+- If target is LARGE and centered: "stop 0 0"
+- If target is centered but MEDIUM/FAR: "forward 80 1.5" or "forward 100 2.0" (faster/longer if far)
+- If target is on the LEFT and CLOSE: "left 60 0.8"
+- If target is on the LEFT and FAR: "forward 90 1.5" (move forward toward it)
+- If target is on the RIGHT and CLOSE: "right 60 0.8"
+- If target is on the RIGHT and FAR: "forward 90 1.5" (move forward toward it)
+- If obstacles block path: "right 70 0.8" (quick dodge)
+
+IMPORTANT: Forward movements MUST use at least 1.0 second duration (preferably 1.5-2.0s)
+Speed range: 40-100 (higher = faster)
+Duration range: 0.5-1.0s for turns, 1.0-2.5s for forward movements"""
+
+    # Query AI
+    response = query_ollama_vision(annotated_img, prompt)
+    
+    if response is None:
+        logger.warning("AI decision failed, defaulting to stop")
+        return 'stop', 0, 0
+    
+    # Parse decision with parameters
+    decision, speed, duration = parse_ai_movement_response(response)
+    logger.info(f"🤖 AI: {decision} (speed={speed}, duration={duration:.1f}s) - reasoning: {response[:40]}...")
+    
+    return decision, speed, duration
+
+
+def ai_search_decision(annotated_img, target_class, other_objects, img_width, img_height):
+    """
+    Use AI to decide search strategy when target is not detected.
+    
+    Args:
+        annotated_img: Image with bounding boxes drawn
+        target_class: Name of target class being searched for (e.g., 'chair')
+        other_objects: List of detected objects (not the target)
+        img_width: Image width in pixels
+        img_height: Image height in pixels
+    
+    Returns:
+        tuple: (decision: str, speed: int, duration: float)
+               decision: 'left', 'right', 'forward'
+               speed: motor speed 0-100
+               duration: movement duration in seconds
+    """
+    # Import here to avoid circular dependency
+    from ollama.ollama_vision import query_ollama_vision
+    
+    obstacles_info = ""
+    if other_objects:
+        obstacles_info = f"\nOther objects visible: {len(other_objects)} - "
+        obstacles_info += ", ".join([f"{obj['class']}" for obj in other_objects[:3]])
+    
+    prompt = f"""You are controlling a robot car searching for a {target_class}.
+
+Current situation:
+- Target {target_class} is NOT visible in the image{obstacles_info}
+
+Respond with EXACTLY this format: <decision> <speed> <duration>
+
+Examples:
+- "right 60 1.5" = rotate right at speed 60 for 1.5 seconds to scan area
+- "left 60 1.5" = rotate left at speed 60 for 1.5 seconds
+- "forward 80 2.0" = move forward at speed 80 for 2.0 seconds to explore
+
+Available search movements:
+- left: rotate left to scan area
+- right: rotate right to scan area  
+- forward: move forward to explore
+
+Decision strategy:
+- If you see open space ahead: "forward 80 2.0" (explore new area with good speed)
+- If the view is cluttered/blocked: "right 60 1.5" or "left 60 1.5" (rotate to search)
+- Occasionally vary your search pattern
+
+IMPORTANT: Forward movements MUST use at least 1.5 seconds duration
+Speed range: 50-90 (use 60 for rotation, 80+ for forward exploration)
+Duration range: 1.0-1.5s for rotations, 1.5-2.5s for forward exploration"""
+
+    # Query AI
+    response = query_ollama_vision(annotated_img, prompt)
+    
+    if response is None:
+        logger.warning("AI search decision failed, defaulting to right (search)")
+        return 'right', 60, 1.5
+    
+    # Parse decision with parameters
+    decision, speed, duration = parse_ai_movement_response(response)
+    logger.info(f"🔍 AI search: {decision} (speed={speed}, duration={duration:.1f}s)")
+    
+    # Validate decision is valid for search mode
+    if decision not in ['left', 'right', 'forward']:
+        logger.warning(f"Invalid search decision '{decision}', defaulting to right")
+        return 'right', 60, 1.5
+    
+    return decision, speed, duration
+
+
 # Movement timing configuration
 MOVEMENT_DELAYS = {
-    'forward': 1.3,        # After autonomous forward movement in navigation
+    'forward': 2,        # After autonomous forward movement in navigation
     'back': 0.8,           # After backing up during obstacle avoidance
     'left': 0.8,           # After left turns in navigation
     'right': 0.6,          # After right turns in navigation
     'manual': 0.1,         # After manual arrow key controls
     'unstuck_back': 0.8,   # Initial backup in vision-based stuck recovery
     'unstuck_turn': 0.8,   # Turns during vision-based stuck recovery scanning
-    'default': 0.3         # Main loop delay between navigation iterations
+    'default': 1.0         # Main loop delay between navigation iterations (longer for AI decisions)
 }
 
 # Movement speed configuration (0-100)
 # Can be overridden by importing module
 MOVEMENT_SPEEDS = {
     'forward_normal': 100,    # When exploring or no objects detected
-    'forward_close': 60,     # When approaching target or avoiding obstacles
+    'forward_close': 100,     # When approaching target or avoiding obstacles
     'back_normal': 80,       # General backing up during obstacle avoidance
     'back_avoid': 80,        # Initial backup in vision-based stuck recovery
     'left_normal': 50,       # Normal left turns when target on left or avoiding obstacles
@@ -269,14 +456,19 @@ def ultrasonic_safety_check(sock, threshold=30):
     return True, distance  # Safe to proceed
 
 
-def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
+def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None):
     """
     Navigate the robot based on YOLO object detection.
     - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair')
     - avoid_classes: list of classes to avoid (e.g., ['person', 'chair', 'dog'])
+    - ai_decide: if True, use AI decision (must provide ai_decision parameter)
+    - ai_decision: Pre-computed AI decision string (if ai_decide=True)
+    - objects: Pre-detected objects list (optional, will detect if not provided)
+    - annotated_img: Pre-annotated image (optional, will annotate if not provided)
     """
     # Vision-based navigation
-    objects, annotated_img = detect_objects_yolo(img, model)
+    if objects is None or annotated_img is None:
+        objects, annotated_img = detect_objects_yolo(img, model, target_class=target_class)
     cv.imshow('Camera', annotated_img)
     cv.waitKey(1)
     
@@ -287,11 +479,14 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
         logger.info(" ")
         logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
         cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
-        return 'forward'
+        return ('forward', MOVEMENT_DELAYS['forward'])
     
     # Filter for target class if specified
     if target_class:
         target_objects = [obj for obj in objects if obj['class'] == target_class]
+        logger.debug(f"🔍 DEBUG: Looking for '{target_class}', found {len(objects)} total objects")
+        logger.debug(f"🔍 DEBUG: Object classes: {[obj['class'] for obj in objects]}")
+        logger.debug(f"🔍 DEBUG: Matching target objects: {len(target_objects)}")
         if target_objects:
             # Find largest target object
             target = max(target_objects, key=lambda x: x['area'])
@@ -299,77 +494,133 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
             # Check for obstacles in the way (objects that are not the target)
             other_objects = [obj for obj in objects if obj['class'] != target_class]
             
-            # If there are other objects blocking the path, avoid them first
-            if other_objects:
-                blocking_objects = [obj for obj in other_objects 
-                                  if obj['area'] > width * height * 0.08 and obj['position'] == 'center']
-                if blocking_objects:
-                    blocker = max(blocking_objects, key=lambda x: x['area'])
-                    logger.warning(f"⚠️ {blocker['class']} blocking path to {target_class}! Avoiding...")
-                    logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                    cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                    return 'avoid_blocker'
+            # AI Decision Mode
+            if ai_decide and ai_decision:
+                # Unpack AI decision tuple: (decision, speed, duration)
+                if isinstance(ai_decision, tuple):
+                    decision, speed, duration = ai_decision
+                else:
+                    # Fallback for old-style string-only decisions
+                    decision = ai_decision
+                    speed = 70
+                    duration = 1.0
+                
+                # Execute the AI's decision with specified speed and duration
+                if decision == 'stop':
+                    logger.info(f"AI: Reached {target_class}, stopping")
+                    logger.debug("\033[91m■ STOP\033[0m")
+                    cmd(sock, 'stop')
+                    return ('reached', 0.3)
+                elif decision == 'forward':
+                    logger.info(f"AI: Moving forward toward {target_class} (speed={speed}, duration={duration:.1f}s)")
+                    logger.debug(f"\033[92m↑ Moving FORWARD (speed={speed}, delay={duration:.1f}s)\033[0m")
+                    cmd(sock, 'move', where='forward', at=speed)
+                    return ('forward', duration)
+                elif decision == 'left':
+                    logger.info(f"AI: Turning left toward {target_class} (speed={speed}, duration={duration:.1f}s)")
+                    logger.debug(f"\033[95m← Turning LEFT (speed={speed}, delay={duration:.1f}s)\033[0m")
+                    cmd(sock, 'move', where='left', at=speed)
+                    return ('left', duration)
+                elif decision == 'right':
+                    logger.info(f"AI: Turning right toward {target_class} (speed={speed}, duration={duration:.1f}s)")
+                    logger.debug(f"\033[96m→ Turning RIGHT (speed={speed}, delay={duration:.1f}s)\033[0m")
+                    cmd(sock, 'move', where='right', at=speed)
+                    return ('right', duration)
+                elif decision == 'avoid':
+                    logger.warning(f"AI: Avoiding obstacle (speed={speed}, duration={duration:.1f}s)")
+                    logger.debug(f"\033[96m→ Avoiding (speed={speed}, delay={duration:.1f}s)\033[0m")
+                    cmd(sock, 'move', where='right', at=speed)
+                    return ('avoid_blocker', duration)
+                else:
+                    # Fallback to stop if AI returns unexpected decision
+                    logger.warning(f"AI returned unexpected decision: {decision}, stopping")
+                    cmd(sock, 'stop')
+                    time.sleep(0.5)
+                    return ('stop', 0.3)
             
-            # Navigate toward target
-            if target['position'] == 'center':
-                # Before moving forward, check again for any blocking objects (more aggressive check)
+            # Hardcoded Logic Mode (original behavior)
+            else:
+                # If there are other objects blocking the path, avoid them first
                 if other_objects:
                     blocking_objects = [obj for obj in other_objects 
-                                      if obj['area'] > width * height * 0.05 and obj['position'] == 'center']
+                                      if obj['area'] > width * height * 0.08 and obj['position'] == 'center']
                     if blocking_objects:
                         blocker = max(blocking_objects, key=lambda x: x['area'])
-                        logger.warning(f"⚠️ {blocker['class']} directly blocking forward path! Avoiding...")
+                        logger.warning(f"⚠️ {blocker['class']} blocking path to {target_class}! Avoiding...")
                         logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                         cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                        return 'avoid_blocker'
+                        return ('avoid_blocker', MOVEMENT_DELAYS['right'])
                 
-                # Check if close enough (object is large)
-                if target['area'] > width * height * 0.3:
-                    logger.info(f"Reached {target_class}, stopping")
-                    logger.debug("\033[91m■ STOP\033[0m")  # Red
-                    cmd(sock, 'stop')
-                    return 'reached'
-                else:
-                    # ULTRASONIC SAFETY CHECK before moving forward (DISABLED - sensor not working)
-                    # safe, distance = ultrasonic_safety_check(sock, threshold=30)
-                    # if not safe:
-                    #     return 'ultrasonic_avoid'
+                # Navigate toward target
+                if target['position'] == 'center':
+                    # Before moving forward, check again for any blocking objects (more aggressive check)
+                    if other_objects:
+                        blocking_objects = [obj for obj in other_objects 
+                                          if obj['area'] > width * height * 0.05 and obj['position'] == 'center']
+                        if blocking_objects:
+                            blocker = max(blocking_objects, key=lambda x: x['area'])
+                            logger.warning(f"⚠️ {blocker['class']} directly blocking forward path! Avoiding...")
+                            logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
+                            cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
+                            return ('avoid_blocker', MOVEMENT_DELAYS['right'])
                     
-                    logger.info(f"Target {target_class} centered, moving forward")
-                    logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-                    cmd(sock, 'move', where='forward', at=movement_speed('forward_close'))
-                    return 'forward'
-            elif target['position'] == 'left':
-                # If chair is large enough (reasonably close), just turn
-                # If still small (far away), move forward while turning
-                if target['area'] > width * height * 0.15:
-                    logger.info(f"Target {target_class} on left (close), turning left")
+                    # Check if close enough (object is large)
+                    if target['area'] > width * height * 0.3:
+                        logger.info(f"Reached {target_class}, stopping")
+                        logger.debug("\033[91m■ STOP\033[0m")  # Red
+                        cmd(sock, 'stop')
+                        return ('reached', 0.3)
+                    else:
+                        # ULTRASONIC SAFETY CHECK before moving forward (DISABLED - sensor not working)
+                        # safe, distance = ultrasonic_safety_check(sock, threshold=30)
+                        # if not safe:
+                        #     return 'ultrasonic_avoid'
+                        
+                        logger.info(f"Target {target_class} centered, moving forward")
+                        logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
+                        cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
+                        return ('forward', MOVEMENT_DELAYS['forward'])
+                elif target['position'] == 'left':
+                    # Turn left to face target - adjust speed/duration based on distance
+                    area_ratio = target['area'] / (width * height)
+                    if area_ratio > 0.15:  # Close - slow, short turn
+                        speed = movement_speed('left_normal')
+                        duration = MOVEMENT_DELAYS['left'] * 0.5  # Shorter
+                        logger.info(f"Target {target_class} on left (close), turning left slowly")
+                    elif area_ratio > 0.05:  # Medium distance
+                        speed = movement_speed('left_normal')
+                        duration = MOVEMENT_DELAYS['left']
+                        logger.info(f"Target {target_class} on left (medium), turning left")
+                    else:  # Far - faster, longer turn
+                        speed = movement_speed('left_normal') 
+                        duration = MOVEMENT_DELAYS['left'] * 1.5  # Longer
+                        logger.info(f"Target {target_class} on left (far), turning left longer")
                     logger.debug("\033[95m← Turning LEFT\033[0m")  # Magenta
-                    cmd(sock, 'move', where='left', at=movement_speed('left_normal'))
-                    return 'left'
-                else:
-                    logger.info(f"Target {target_class} on left (far), moving forward")
-                    logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-                    cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
-                    return 'forward'
-            else:  # right
-                # If chair is large enough (reasonably close), just turn
-                # If still small (far away), move forward while turning
-                if target['area'] > width * height * 0.15:
-                    logger.info(f"Target {target_class} on right (close), turning right")
+                    cmd(sock, 'move', where='left', at=speed)
+                    return ('left', duration)
+                else:  # right
+                    # Turn right to face target - adjust speed/duration based on distance
+                    area_ratio = target['area'] / (width * height)
+                    if area_ratio > 0.15:  # Close - slow, short turn
+                        speed = movement_speed('right_normal')
+                        duration = MOVEMENT_DELAYS['right'] * 0.5  # Shorter
+                        logger.info(f"Target {target_class} on right (close), turning right slowly")
+                    elif area_ratio > 0.05:  # Medium distance
+                        speed = movement_speed('right_normal')
+                        duration = MOVEMENT_DELAYS['right']
+                        logger.info(f"Target {target_class} on right (medium), turning right")
+                    else:  # Far - faster, longer turn
+                        speed = movement_speed('right_normal')
+                        duration = MOVEMENT_DELAYS['right'] * 1.5  # Longer
+                        logger.info(f"Target {target_class} on right (far), turning right longer")
                     logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                    cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
-                    return 'right'
-                else:
-                    logger.info(f"Target {target_class} on right (far), moving forward")
-                    logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-                    cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
-                    return 'forward'
+                    cmd(sock, 'move', where='right', at=speed)
+                    return ('right', duration)
         else:
             # Target not found, search by rotating
             logger.warning(f"Searching for {target_class}...")
             cmd(sock, 'move', where='right', at=movement_speed('right_search'))
-            return 'searching'
+            return ('searching', MOVEMENT_DELAYS['right'])
     
     # Avoid obstacles mode
     if avoid_classes:
@@ -387,20 +638,20 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None):
             if obstacle['position'] == 'center':
                 logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                 cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                return 'avoid_right'
+                return ('avoid_right', MOVEMENT_DELAYS['right'])
             elif obstacle['position'] == 'left':
                 logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                 cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
-                return 'avoid_right'
+                return ('avoid_right', MOVEMENT_DELAYS['right'])
             else:  # right
                 logger.debug("\033[95m← Turning LEFT\033[0m")  # Magenta
                 cmd(sock, 'move', where='left', at=movement_speed('left_normal'))
-                return 'avoid_left'
+                return ('avoid_left', MOVEMENT_DELAYS['left'])
         else:
             # Obstacles far enough, can move forward
             logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
             cmd(sock, 'move', where='forward', at=movement_speed('forward_close'))
-            return 'forward'
+            return ('forward', MOVEMENT_DELAYS['forward'])
     
-    return 'idle'
+    return ('idle', 0.3)
 

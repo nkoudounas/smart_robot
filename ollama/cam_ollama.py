@@ -8,13 +8,13 @@ import sys
 import time
 
 # Import robot communication functions
-from robot_utils import (
+from utils.robot_utils import (
     capture, cmd, check_connection, 
     setup_socket_options, reconnect_robot
 )
 
 # Import Ollama vision functions
-from ollama.ollama_vision import (
+from .ollama_vision import (
     query_ollama_vision, parse_ollama_decision,
     check_ollama_connection
 )
@@ -24,14 +24,56 @@ cv.namedWindow('Camera', cv.WINDOW_NORMAL)
 cv.resizeWindow('Camera', 800, 600)
 cv.moveWindow('Camera', 0, 0)
 
-def navigate_with_ollama(sock, img):
-    """Ask Ollama to decide robot movement and execute it"""
+def navigate_with_ollama(sock, img, target_class=None, avoid_classes=None):
+    """
+    Ask Ollama to decide robot movement and execute it.
+    
+    Args:
+        sock: Robot socket connection
+        img: Camera image
+        target_class: Specific object to navigate toward (e.g., 'chair', 'person')
+        avoid_classes: List of object classes to avoid (currently not used, reserved for future)
+    
+    Returns:
+        Movement decision string
+    """
     if img is None:
         print("ERROR: No image for navigation")
         return None
     
-    # Navigation prompt
-    prompt = """You are controlling a robot car. Look at this image from the robot's camera.
+    # Show original image immediately for responsive feedback
+    cv.imshow('Camera', img)
+    cv.waitKey(1)
+    
+    # Build navigation prompt based on target
+    if target_class:
+        prompt = f"""You are controlling a robot car. Look at this image from the robot's camera.
+
+Your GOAL: Navigate toward the {target_class}.
+
+Available movements:
+- forward: move straight ahead
+- left: turn left
+- right: turn right  
+- back: move backward
+- stop: stop moving
+
+Instructions:
+1. First, identify if there is a {target_class} in the image
+2. If you see the {target_class}:
+   - If it's in the CENTER and CLOSE (large in frame): respond with "stop" (you've reached it)
+   - If it's in the CENTER but FAR: respond with "forward" (move toward it)
+   - If it's on the LEFT side: respond with "left" (turn to face it)
+   - If it's on the RIGHT side: respond with "right" (turn to face it)
+3. If you DON'T see the {target_class}:
+   - Respond with "right" (search by rotating)
+4. If there are obstacles blocking your path to the {target_class}:
+   - Respond with "right" or "left" to avoid them
+
+Respond with ONLY ONE WORD from the available movements above."""
+    else:
+        # General navigation (no specific target)
+        prompt = """You are controlling a robot car. Look at this image from the robot's camera.
         Available movements:
         - forward: move straight ahead
         - left: turn left
@@ -56,16 +98,31 @@ def navigate_with_ollama(sock, img):
     
     # Parse decision
     decision = parse_ollama_decision(response)
+    
+    # Display results with target info
+    if target_class:
+        print(f"🎯 Target: {target_class}")
     print(f"🤖 Ollama says: {response[:60]}...")
     print(f"→ Decision: {decision}")
     
-    # Show on image
+    # Show annotated image with Ollama's decision
     annotated_img = img.copy()
-    cv.putText(annotated_img, f"Decision: {decision.upper()}", (10, 30), 
-               cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-    cv.putText(annotated_img, response[:80], (10, 60), 
-               cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
+    # Show target if specified
+    if target_class:
+        cv.putText(annotated_img, f"Target: {target_class.upper()}", (10, 30), 
+                   cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv.putText(annotated_img, f"Decision: {decision.upper()}", (10, 65), 
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv.putText(annotated_img, response[:80], (10, 95), 
+                   cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    else:
+        cv.putText(annotated_img, f"Decision: {decision.upper()}", (10, 30), 
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv.putText(annotated_img, response[:80], (10, 60), 
+                   cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Replace with annotated image
     cv.imshow('Camera', annotated_img)
     cv.waitKey(1)
     

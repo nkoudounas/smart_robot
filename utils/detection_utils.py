@@ -22,14 +22,16 @@ def initialize_yolo_model(model_name='yolov8n.pt'):
     print("This may download the model on first run (~6MB for yolov8n)...")
     try:
         model = YOLO(model_name)
-        print(f"✓ Model {model_name} loaded successfully!")
+        # Force CPU usage to avoid CUDA memory errors
+        model.to('cpu')
+        print(f"✓ Model {model_name} loaded successfully (using CPU)!")
         return model
     except Exception as e:
         print(f"Error loading model: {e}")
         sys.exit(1)
 
 
-def detect_objects_yolo(img, model, confidence=0.5):
+def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
     """
     Detect objects using YOLO model.
     
@@ -37,6 +39,7 @@ def detect_objects_yolo(img, model, confidence=0.5):
         img: Input image (BGR format)
         model: YOLO model instance
         confidence: Confidence threshold for detections (0.0-1.0)
+        target_class: Optional target class name to highlight in green
         
     Returns: 
         tuple: (list of detected objects, annotated image)
@@ -46,11 +49,26 @@ def detect_objects_yolo(img, model, confidence=0.5):
         print("ERROR: Cannot detect objects, image is None")
         return [], None
     
+    # Generate distinct colors for different classes (using HSV for better distribution)
+    def get_class_color(class_name, is_target=False):
+        if is_target:
+            return (0, 255, 0)  # Green for target class
+        
+        # Generate consistent color per class name using hash
+        # Hash to hue (0-179 for OpenCV HSV), saturation and value
+        hash_val = abs(hash(class_name))
+        hue = (hash_val % 180)  # OpenCV uses 0-179 for hue
+        saturation = 200
+        value = 200
+        hsv_color = np.uint8([[[hue, saturation, value]]])
+        bgr_color = cv.cvtColor(hsv_color, cv.COLOR_HSV2BGR)[0][0]
+        return tuple(map(int, bgr_color))
+    
     try:
         height, width = img.shape[:2]
         
-        # Run YOLO inference
-        results = model(img, verbose=False, conf=confidence)
+        # Run YOLO inference on CPU to avoid CUDA errors
+        results = model(img, verbose=False, conf=confidence, device='cpu')
     except Exception as e:
         print(f"ERROR in YOLO detection: {e}")
         return [], img
@@ -81,11 +99,23 @@ def detect_objects_yolo(img, model, confidence=0.5):
                 # Determine position relative to image center
                 position = 'center' if abs(center_x - width//2) < width//6 else 'left' if center_x < width//2 else 'right'
                 
-                # Draw bounding box
-                color = (0, 255, 0)  # Green for all objects
-                cv.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                # Determine color based on whether it's the target class
+                is_target = (target_class is not None and class_name == target_class)
+                color = get_class_color(class_name, is_target)
+                
+                # Draw bounding box with thicker line for target
+                thickness = 3 if is_target else 2
+                cv.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+                
+                # Build label with target indicator
                 label = f'{class_name} {conf:.2f}'
-                cv.putText(img, label, (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                if is_target:
+                    label = f'🎯 {label}'
+                
+                # Draw label background for better readability
+                (label_w, label_h), _ = cv.getTextSize(label, cv.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv.rectangle(img, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+                cv.putText(img, label, (x1, y1 - 5), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 objects.append({
                     'class': class_name,
@@ -96,7 +126,8 @@ def detect_objects_yolo(img, model, confidence=0.5):
                     'height': h,
                     'area': area,
                     'position': position,
-                    'bbox': (x1, y1, x2, y2)
+                    'bbox': (x1, y1, x2, y2),
+                    'is_target': is_target
                 })
     except Exception as e:
         print(f"ERROR processing YOLO results: {e}")

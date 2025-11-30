@@ -421,7 +421,7 @@ def update_plot(ax):
     plt.pause(0.001)  # Very short pause to update display
 
 
-def run_navigation_loop(sock, model,stop_n_think):
+def run_navigation_loop(sock, model, use_ollama, ai_decide):
     """
     Main navigation loop with YOLO object detection.
     Returns: final iteration count
@@ -532,19 +532,98 @@ def run_navigation_loop(sock, model,stop_n_think):
                 update_plot(ax)
                 continue
 
-            # Navigate using YOLO - looking for chair
-            # Ultrasonic check is now INSIDE navigate_with_yolo when moving forward
+            # First, detect objects with YOLO to get annotated image with bounding boxes
+            from utils.detection_utils import detect_objects_yolo
+            objects, annotated_img = detect_objects_yolo(img, model, target_class='chair')
+            
+            # Log all detected objects with their labels and probabilities
+            if objects:
+                logger.info(f"📸 Detected {len(objects)} object(s):")
+                for i, obj in enumerate(objects, 1):
+                    logger.info(f"  {i}. {obj['class']} - confidence: {obj['confidence']:.2%} - position: {obj['position']} - area: {obj['area']:.0f}px²")
+            else:
+                logger.info("📸 No objects detected in current frame")
+            
+            # Navigate using YOLO or Ollama
             try:
-                # First, detect objects for marking on map
-                from utils.detection_utils import detect_objects_yolo
-                objects, annotated_img = detect_objects_yolo(img, model)
-                
-                # Mark detected objects on the map
-                height, width = img.shape[:2]
-                mark_detected_objects(objects, width)
-                
-                # Now navigate
-                result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None)
+                if use_ollama:
+
+                    
+                    # Show YOLO detections briefly
+                    cv.imshow('Camera', annotated_img)
+                    cv.waitKey(1)
+                    
+                    # Now use Ollama with the ANNOTATED image (with bounding boxes)
+                    from ollama.cam_ollama import navigate_with_ollama
+                    result = navigate_with_ollama(sock, annotated_img, target_class='chair')
+                    
+                    # Wait for movement to execute before reconnecting
+                    # Robot closes connection immediately after sending command
+                    # but we need to give it time to execute the movement
+                    time.sleep(0.3)  # Brief pause to let robot start movement
+                    
+                    # Ollama navigation sends 1 command, robot closes connection after - reconnect
+                    logger.debug("Reconnecting after Ollama navigation command...")
+                    sock = reconnect_robot(sock)
+                    if sock is None:
+                        logger.error("Failed to reconnect after Ollama navigation")
+                        paused = True
+                        continue
+                else:
+                    # Mark detected objects on the map
+                    height, width = img.shape[:2]
+                    mark_detected_objects(objects, width)
+                    
+                    # If AI decision mode is enabled, compute decision BEFORE calling navigate
+                    ai_decision = None
+                    if ai_decide:
+                        # Reconnect before AI call to ensure fresh connection after AI finishes
+                        # (AI takes 2-5+ seconds, robot firmware might close idle connection)
+                        logger.debug("Reconnecting before AI decision call...")
+                        sock = reconnect_robot(sock)
+                        if sock is None:
+                            logger.error("Failed to reconnect before AI decision")
+                            paused = True
+                            continue
+                        
+                        # Find target and compute AI decision while socket is idle
+                        target_objects = [obj for obj in objects if obj['class'] == 'chair']
+                        if target_objects:
+                            target = max(target_objects, key=lambda x: x['area'])
+                            other_objects = [obj for obj in objects if obj['class'] != 'chair']
+                            
+                            # Call AI decision function (takes 5+ seconds)
+                            from utils.navigation_utils import ai_navigation_decision
+                            ai_decision = ai_navigation_decision(annotated_img, target, other_objects, 'chair', width, height)
+                        else:
+                            # No target found - AI can still decide (search, explore, etc.)
+                            logger.info("No chair detected, querying AI for search strategy...")
+                            from utils.navigation_utils import ai_search_decision
+                            ai_decision = ai_search_decision(annotated_img, 'chair', objects, width, height)
+                    
+                    # Now navigate with YOLO (with pre-computed AI decision if enabled)
+                    result = navigate_with_yolo(sock, img, model, target_class='chair', avoid_classes=None, 
+                                              ai_decide=ai_decide, ai_decision=ai_decision,
+                                              objects=objects, annotated_img=annotated_img)
+                    
+                    # Extract duration from tuple (both AI and hardcoded modes return tuples now)
+                    if isinstance(result, tuple):
+                        _, sleep_duration = result
+                        # Sleep for the full duration to let robot physically complete the movement
+                        logger.debug(f"Waiting {sleep_duration:.1f}s for movement to complete...")
+                        time.sleep(sleep_duration)
+                    else:
+                        # Fallback for non-tuple returns (e.g., 'reached', 'idle')
+                        time.sleep(0.3)
+                    
+                    # Robot firmware closes connection after each command - must reconnect
+                    # Reconnect AFTER movement completes (we already slept above)
+                    logger.debug("Reconnecting after movement command (robot closes socket after each cmd)...")
+                    sock = reconnect_robot(sock)
+                    if sock is None:
+                        logger.error("Failed to reconnect after YOLO navigation")
+                        paused = True
+                        continue
                 
                 # If ultrasonic triggered, we used 3 commands - reconnect immediately
                 if result == 'ultrasonic_avoid':
@@ -556,6 +635,11 @@ def run_navigation_loop(sock, model,stop_n_think):
                         continue
                 
                 # Update position estimate based on navigation result
+                # AI mode returns tuple (result, duration), hardcoded mode returns string
+                ai_duration = None
+                if isinstance(result, tuple):
+                    result, ai_duration = result
+                
                 if result and result != 'idle':
                     if result == 'ultrasonic_avoid':
                         # Ultrasonic avoid does back then right
@@ -563,7 +647,8 @@ def run_navigation_loop(sock, model,stop_n_think):
                         update_robot_position('back', duration=MOVEMENT_DELAYS['back'])
                         update_robot_position('right', duration=MOVEMENT_DELAYS['right'])
                     elif result in ['forward', 'back']:
-                        update_robot_position(result, duration=MOVEMENT_DELAYS[result])
+                        duration = ai_duration if ai_duration else MOVEMENT_DELAYS[result]
+                        update_robot_position(result, duration=duration)
                     elif result in ['left', 'right', 'avoid_left', 'avoid_right', 'avoid_blocker', 'searching']:
                         cmd_type = result.replace('avoid_', '').replace('_blocker', '')
                         if cmd_type == 'searching':
@@ -572,7 +657,8 @@ def run_navigation_loop(sock, model,stop_n_think):
                                 cmd_type = 'left'
                             else:
                                 cmd_type = 'right'
-                        update_robot_position(cmd_type, duration=MOVEMENT_DELAYS.get(cmd_type, MOVEMENT_DELAYS['default']))
+                        duration = ai_duration if ai_duration else MOVEMENT_DELAYS.get(cmd_type, MOVEMENT_DELAYS['default'])
+                        update_robot_position(cmd_type, duration=duration)
                 
                 # Update live plot
                 update_plot(ax)
@@ -596,7 +682,10 @@ def run_navigation_loop(sock, model,stop_n_think):
                 continue
             
             # Delay between commands
-            movement_delay('default')
+            # AI mode: no additional delay needed (already slept for ai_duration)
+            # Hardcoded mode: use default movement delay
+            if not (ai_decide and ai_duration is not None):
+                movement_delay('default')
             
     except KeyboardInterrupt:
         logger.critical("\n\nEmergency stop - Ctrl+C pressed!")
@@ -618,8 +707,13 @@ def run_navigation_loop(sock, model,stop_n_think):
     return iteration_count
 
 
-def main(stop_n_think):
-    """Main entry point"""
+def main(use_ollama=False, ai_decide=False):
+    """Main entry point
+    
+    Args:
+        use_ollama: If True, use Ollama for full navigation (deprecated - use ai_decide instead)
+        ai_decide: If True, use AI (Ollama/Gemini) for decision making in YOLO navigation
+    """
     # Initialize YOLO model
     model = initialize_yolo_model('yolo11l.pt')
     
@@ -627,12 +721,13 @@ def main(stop_n_think):
     sock = connect_to_robot()
     
     # Run navigation loop
-    final_iterations = run_navigation_loop(sock, model,stop_n_think)
+    final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide)
     
     logger.info(f"\nTotal iterations completed: {final_iterations}")
     logger.info("Program ended")
 
 
 if __name__ == '__main__':
-    stop_n_think = True
-    main(stop_n_think)
+    use_ollama = False  # Deprecated: use full Ollama navigation
+    ai_decide = True    # NEW: Use AI for decision making with YOLO detection
+    main(use_ollama, ai_decide)
