@@ -44,6 +44,7 @@ from utils.detection_utils import (
 # Import navigation functions
 from utils.navigation_utils import ai_search_decision, navigate_with_yolo, movement_delay, movement_speed, MOVEMENT_DELAYS, MOVEMENT_SPEEDS
 from utils.depth_estimation import DepthEstimator
+from utils.video_logger import VideoLogger
 
 from utils.connection_utils import connect_to_robot,periodic_reconnect
 
@@ -81,11 +82,15 @@ PIXEL_DIFF_THRESHOLD = 0.02  # 2% pixel difference threshold
 ai_decision_history = []
 AI_MEMORY_SIZE = 5  # Keep last 5 decisions
 
+# Video recording
+video_logger = None
+
 
 def print_controls():
     """Print keyboard control instructions"""
     logger.info("\nKeyboard Controls:")
     logger.info("  'k' - Stop and exit")
+    logger.info("  'v' - Save video and exit")
     logger.info("  'r' - Restart navigation")
     logger.info("  'p' - Pause/resume autonomous mode")
     logger.info("  Arrow Keys - Manual control:")
@@ -102,7 +107,7 @@ def handle_keyboard_input(sock):
     Handle keyboard input for manual control.
     Returns: command string or None to continue autonomous mode
     """
-    global paused, manual_mode, iteration_count
+    global paused, manual_mode, iteration_count, video_logger
     
     key = cv.waitKey(1) & 0xFF
     
@@ -133,6 +138,11 @@ def handle_keyboard_input(sock):
         else:
             logger.info("'p' pressed - RESUMED (Autonomous mode enabled)")
         return 'pause'
+    
+    # Save video and exit command
+    elif key == ord('v'):
+        logger.info("\n'v' pressed - Saving video and exiting...")
+        return 'save_and_exit'
     
     # Manual controls with arrow keys
     elif key == 82 or key == 0:  # Up arrow
@@ -432,7 +442,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
     Returns: final iteration count
     """
     # target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
-    global iteration_count, paused
+    global iteration_count, paused, video_logger
     
     logger.info("\nStarting autonomous navigation with YOLO...")
     logger.warning("\nNOTE: Robot firmware closes connection after 8 commands - auto-reconnecting every 3 iterations")
@@ -448,6 +458,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
     update_plot(ax, target)  # Draw initial plot
     
     iteration_count = 0
+    video_initialized = False  # Track if video has been initialized
     
     try:
         while True:
@@ -455,6 +466,14 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
             key_result = handle_keyboard_input(sock)
             
             if key_result == 'exit':
+                break
+            elif key_result == 'save_and_exit':
+                # Save video and exit
+                if video_logger and video_logger.is_recording:
+                    video_logger.add_log("Saving video and exiting...", "INFO")
+                    video_logger.stop_recording()
+                    logger.info(f"✅ Video saved: {video_logger.output_path}")
+                logger.info("Exiting program...")
                 break
             elif key_result in ['restart', 'pause', 'manual', 'stop']:
                 if key_result == 'restart':
@@ -494,6 +513,14 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                 logger.error("ERROR: Failed to capture image, retrying...")
                 time.sleep(0.5)
                 continue
+            
+            # Initialize video logger on first successful frame capture
+            if not video_initialized:
+                video_logger = VideoLogger(fps=2.0, frame_width=640, frame_height=480)
+                video_logger.start_recording()
+                video_logger.add_log("Navigation started", "INFO")
+                logger.info("📹 Video recording auto-started")
+                video_initialized = True
 
             # Check if robot is stuck (same view for multiple frames)
             if is_robot_stuck(img):
@@ -545,10 +572,16 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
             # Log all detected objects with their labels and probabilities
             if objects:
                 logger.info(f"📸 Detected {len(objects)} object(s):")
+                if video_logger and video_logger.is_recording:
+                    video_logger.add_log(f"Detected {len(objects)} object(s)", "INFO")
                 for i, obj in enumerate(objects, 1):
                     logger.info(f"  {i}. {obj['class']} - confidence: {obj['confidence']:.2%} - position: {obj['position']} - area: {obj['area']:.0f}px²")
+                    if video_logger and video_logger.is_recording:
+                        video_logger.add_log(f"{obj['class']} {obj['confidence']:.0%} {obj['position']}", "DEBUG")
             else:
                 logger.info("📸 No objects detected in current frame")
+                if video_logger and video_logger.is_recording:
+                    video_logger.add_log("No objects detected", "WARNING")
             
             # Navigate using YOLO or Ollama
             try:
@@ -593,6 +626,10 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                             # Call AI decision function (takes 5+ seconds)
                             from utils.navigation_utils import ai_navigation_decision
                             ai_decision = ai_navigation_decision(annotated_img, target_obj, other_objects, target, width, height, ai_decision_history)
+                            
+                            # Log AI decision to video
+                            if video_logger and video_logger.is_recording and ai_decision:
+                                video_logger.add_log(f"AI Decision: {ai_decision}", "INFO")
                         else:
                             # No target found - use smart search instead of AI search
                             logger.info(f"No {target} detected, will use smart search...")
@@ -611,20 +648,29 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                     # Now navigate with YOLO (with pre-computed AI decision if enabled)
                     result = navigate_with_yolo(sock, annotated_img, model, target_class=target, avoid_classes=None, 
                                               ai_decide=ai_decide, ai_decision=ai_decision,
-                                              objects=objects, annotated_img=annotated_img)
+                                              objects=objects, annotated_img=annotated_img, video_logger=video_logger)
                     
                     # If searching (no target found), use smart search
                     if result and result[0] == 'searching':
                         logger.info("🔍 Initiating smart search...")
-                        if ai_decide:
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log("🔍 Initiating smart search", "INFO")
+                        
+                        if ai_decide or False:
                             # Use AI-based search decision
                             from utils.navigation_utils import ai_search_decision
                             sock, direction, duration = ai_search_decision(sock, annotated_img, model, target, capture, reconnect_robot, decision_history=ai_decision_history)
+                            
+                            if video_logger and video_logger.is_recording and direction:
+                                video_logger.add_log(f"AI Search: {direction}", "INFO")
                         else:
                             # Use traditional smart search
                             from utils.navigation_utils import smart_search_for_target                        
                             sock, direction = smart_search_for_target(sock, annotated_img, model, target, capture, reconnect_robot)
                             duration = MOVEMENT_DELAYS.get(direction, MOVEMENT_DELAYS['default']) if direction else MOVEMENT_DELAYS['default']
+                            
+                            if video_logger and video_logger.is_recording and direction:
+                                video_logger.add_log(f"Smart Search: {direction}", "INFO")
                         
                         if sock is None:
                             logger.error("Search failed - socket disconnected")
@@ -664,6 +710,11 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                         # Keep only last N decisions
                         if len(ai_decision_history) > AI_MEMORY_SIZE:
                             ai_decision_history.pop(0)
+                        
+                        # Log to video if recording
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"AI Decision: {decision_str} (speed={speed}, dur={duration:.1f}s)", "INFO")
+                            video_logger.add_log(f"Target: {target_pos}, {len(objects)} objects detected", "DEBUG")
                     
                     # Extract duration from tuple (both AI and hardcoded modes return tuples now)
                     if isinstance(result, tuple):
@@ -722,8 +773,16 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
                 # Update live plot
                 update_plot(ax, target)
                 
+                # Write frame to video if recording
+                if video_logger and video_logger.is_recording:
+                    combined_frame = video_logger.write_frame(annotated_img)
+                    # Optionally show combined frame instead of just camera
+                    # cv.imshow('Camera', combined_frame)
+                
             except Exception as e:
                 logger.error(f"\n!!! ERROR in navigation at iteration {iteration_count}: {e}")
+                if video_logger and video_logger.is_recording:
+                    video_logger.add_log(f"ERROR: {str(e)[:50]}", "ERROR")
                 result = None
             
             # Handle navigation failure
@@ -759,6 +818,11 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
         if check_connection(sock):
             cmd(sock, 'stop')
     finally:
+        # Stop video recording if active
+        if video_logger and video_logger.is_recording:
+            logger.info("Stopping video recording...")
+            video_logger.stop_recording()
+        
         sock.close()
         cv.destroyAllWindows()
         plt.close('all')
@@ -766,16 +830,22 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair'):
     return iteration_count
 
 
-def main(use_ollama=False, ai_decide=False, target='chair'):
+def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False):
     """Main entry point
     
     Args:
         use_ollama: If True, use Ollama for full navigation (deprecated - use ai_decide instead)
         ai_decide: If True, use AI (Ollama/Gemini) for decision making in YOLO navigation
         target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
+        use_segmentation: If True, use YOLO segmentation model (yolo11l-seg.pt)
     """
-    # Initialize YOLO model
-    model = initialize_yolo_model('yolo11x.pt')
+    # Initialize YOLO model - use segmentation if requested
+    if use_segmentation:
+        model_name = 'yolo11x-seg.pt'  # Large segmentation model
+    else:
+        model_name = 'yolo11x.pt'  # Extra large detection model
+    
+    model = initialize_yolo_model(model_name, use_segmentation=use_segmentation)
     
     # Connect to robot
     sock = connect_to_robot()
@@ -789,6 +859,7 @@ def main(use_ollama=False, ai_decide=False, target='chair'):
 
 if __name__ == '__main__':
     use_ollama = False  # Deprecated: use full Ollama navigation
-    ai_decide = True    # NEW: Use AI for decision making with YOLO detection
+    ai_decide =  True    # NEW: Use AI for decision making with YOLO detection
     target = 'chair'     # Target object class to search for
-    main(use_ollama, ai_decide, target)
+    use_segmentation = True  # Use YOLO segmentation model for better object understanding
+    main(use_ollama, ai_decide, target, use_segmentation)

@@ -641,7 +641,7 @@ def smart_search_for_target(sock, og_annotated_img, model, target_class, capture
         return sock, direction
 
 
-def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None):
+def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None, video_logger=None):
     """
     Navigate the robot based on YOLO object detection.
     - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair','ball')
@@ -650,6 +650,7 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
     - ai_decision: Pre-computed AI decision string (if ai_decide=True)
     - objects: Pre-detected objects list (optional, will detect if not provided)
     - annotated_img: Pre-annotated image (optional, will annotate if not provided)
+    - video_logger: VideoLogger instance for recording logs to video (optional)
     """
     # Vision-based navigation
     if objects is None or annotated_img is None:
@@ -731,6 +732,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                     if blocking_objects:
                         blocker = max(blocking_objects, key=lambda x: x['area'])
                         logger.warning(f"⚠️ {blocker['class']} blocking path to {target_class}! Avoiding...")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"⚠️ {blocker['class']} blocking path! Avoiding", "WARNING")
                         logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                         cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
                         return ('avoid_blocker', MOVEMENT_DELAYS['right'])
@@ -744,6 +747,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                         if blocking_objects:
                             blocker = max(blocking_objects, key=lambda x: x['area'])
                             logger.warning(f"⚠️ {blocker['class']} directly blocking forward path! Avoiding...")
+                            if video_logger and video_logger.is_recording:
+                                video_logger.add_log(f"⚠️ {blocker['class']} directly blocking! Avoiding", "WARNING")
                             logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
                             cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
                             return ('avoid_blocker', MOVEMENT_DELAYS['right'])
@@ -751,6 +756,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                     # Check if close enough (object is large)
                     if target['area'] > width * height * 0.3:
                         logger.info(f"Reached {target_class}, stopping")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Reached {target_class}, stopping", "INFO")
                         logger.debug("\033[91m■ STOP\033[0m")  # Red
                         cmd(sock, 'stop')
                         return ('reached', 0.3)
@@ -761,6 +768,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                         #     return 'ultrasonic_avoid'
                         
                         logger.info(f"Target {target_class} centered, moving forward")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} centered, moving forward", "INFO")
                         logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
                         cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
                         return ('forward', MOVEMENT_DELAYS['forward'])
@@ -773,16 +782,22 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                         speed = movement_speed('left_normal')
                         duration = MOVEMENT_DELAYS['left'] * 0.5  # Shorter
                         logger.info(f"Target {target_class} on left (close), turning left slowly")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on left (close), turning left slowly", "INFO")
 
                     elif area_ratio > 0.05:  # Medium distance
                         speed = movement_speed('left_normal')
                         duration = MOVEMENT_DELAYS['left']
                         logger.info(f"Target {target_class} on left (medium), turning left")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on left (medium), turning left", "INFO")
 
                     else:  # Far - faster, longer turn
                         speed = movement_speed('target_on_sides') 
                         duration = MOVEMENT_DELAYS['target_on_sides'] 
                         logger.info(f"Target {target_class} on left (far), going forward")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on left (far), going forward", "INFO")
                         where = 'forward'
 
                     logger.debug(f"\033[95m← Going {where}\033[0m")  # Magenta
@@ -796,16 +811,22 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                         speed = movement_speed('right_normal')
                         duration = MOVEMENT_DELAYS['right'] * 0.5  # Shorter
                         logger.info(f"Target {target_class} on right (close), turning right slowly")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on right (close), turning right slowly", "INFO")
 
                     elif area_ratio > 0.05:  # Medium distance
                         speed = movement_speed('right_normal')
                         duration = MOVEMENT_DELAYS['right']
                         logger.info(f"Target {target_class} on right (medium), turning right")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on right (medium), turning right", "INFO")
 
                     else:  # Far - faster, longer turn
                         speed = movement_speed('target_on_sides')
                         duration = MOVEMENT_DELAYS['target_on_sides']
                         logger.info(f"Target {target_class} on right (far), going forward")
+                        if video_logger and video_logger.is_recording:
+                            video_logger.add_log(f"Target {target_class} on right (far), going forward", "INFO")
                         where = 'forward'
 
                     logger.debug(f"\033[96m→ Going {where}\033[0m")  # Cyan

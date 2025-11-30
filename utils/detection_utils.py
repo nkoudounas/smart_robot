@@ -8,23 +8,29 @@ from ultralytics import YOLO
 import sys
 
 
-def initialize_yolo_model(model_name='yolov8n.pt'):
+def initialize_yolo_model(model_name='yolov8n.pt', use_segmentation=False):
     """
     Download and initialize YOLO model.
     
     Args:
-        model_name: Name of YOLO model ('yolov8n.pt', 'yolov8s.pt', etc.)
+        model_name: Name of YOLO model ('yolov8n.pt', 'yolo11l-seg.pt', etc.)
+        use_segmentation: If True, load a segmentation model (e.g., 'yolo11l-seg.pt')
         
     Returns: 
         YOLO model instance
     """
-    print(f"Initializing YOLO model: {model_name}")
-    print("This may download the model on first run (~6MB for yolov8n)...")
+    # Auto-detect segmentation model from name if not specified
+    if '-seg' in model_name:
+        use_segmentation = True
+    
+    print(f"Initializing YOLO model: {model_name} (segmentation={use_segmentation})")
+    print("This may download the model on first run...")
     try:
         model = YOLO(model_name)
         # Force CPU usage to avoid CUDA memory errors
         model.to('cpu')
-        print(f"✓ Model {model_name} loaded successfully (using CPU)!")
+        model_type = "segmentation" if use_segmentation else "detection"
+        print(f"✓ Model {model_name} loaded successfully (using CPU, type={model_type})!")
         return model
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -33,7 +39,7 @@ def initialize_yolo_model(model_name='yolov8n.pt'):
 
 def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
     """
-    Detect objects using YOLO model.
+    Detect objects using YOLO model (supports both detection and segmentation models).
     
     Args:
         img: Input image (BGR format)
@@ -79,7 +85,11 @@ def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
         # Process detections
         for result in results:
             boxes = result.boxes
-            for box in boxes:
+            
+            # Check if model has segmentation masks
+            has_masks = hasattr(result, 'masks') and result.masks is not None
+            
+            for idx, box in enumerate(boxes):
                 # Get box coordinates
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -102,6 +112,24 @@ def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
                 # Determine color based on whether it's the target class
                 is_target = (target_class is not None and class_name == target_class)
                 color = get_class_color(class_name, is_target)
+                
+                # Draw segmentation mask if available
+                if has_masks:
+                    mask = result.masks.data[idx].cpu().numpy()
+                    # Resize mask to image dimensions
+                    mask_resized = cv.resize(mask, (width, height))
+                    mask_resized = (mask_resized > 0.5).astype(np.uint8)
+                    
+                    # Create colored mask overlay
+                    mask_colored = np.zeros_like(img)
+                    mask_colored[mask_resized == 1] = color
+                    
+                    # Blend with original image (30% mask, 70% original)
+                    img = cv.addWeighted(img, 0.7, mask_colored, 0.3, 0)
+                    
+                    # Draw contour around mask
+                    contours, _ = cv.findContours(mask_resized, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+                    cv.drawContours(img, contours, -1, color, 2)
                 
                 # Draw bounding box with thicker line for target
                 thickness = 3 if is_target else 2
@@ -127,7 +155,8 @@ def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
                     'area': area,
                     'position': position,
                     'bbox': (x1, y1, x2, y2),
-                    'is_target': is_target
+                    'is_target': is_target,
+                    'has_mask': has_masks
                 })
     except Exception as e:
         print(f"ERROR processing YOLO results: {e}")

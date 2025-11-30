@@ -1,7 +1,7 @@
 # YOLO model files
 *.pt
 yolov8*.pt
-
+videos/*
 # Python cache
 __pycache__/
 *.pyc
