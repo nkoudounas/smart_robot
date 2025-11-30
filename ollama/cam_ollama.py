@@ -31,7 +31,7 @@ def navigate_with_ollama(sock, img, target_class=None, avoid_classes=None):
     Args:
         sock: Robot socket connection
         img: Camera image
-        target_class: Specific object to navigate toward (e.g., 'chair', 'person')
+        target_class: Specific object to navigate toward (e.g., 'chair', 'person','ball')
         avoid_classes: List of object classes to avoid (currently not used, reserved for future)
     
     Returns:

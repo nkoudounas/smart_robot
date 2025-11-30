@@ -61,7 +61,7 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
         annotated_img: Image with bounding boxes drawn
         target: Target object dict (with position, area, class, etc.)
         other_objects: List of other detected objects (obstacles)
-        target_class: Name of target class (e.g., 'chair')
+        target_class: Name of target class (e.g., 'chair','ball')
         img_width: Image width in pixels
         img_height: Image height in pixels
         decision_history: List of recent AI decisions (for context)
@@ -96,6 +96,10 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
                 history_info += "\n"
         history_info += "\nAnalyze: Are you making progress? Is target getting larger/more centered? Try different approach if stuck!"
     
+    # Build movement configuration reference for AI
+    speed_config = "Available speeds (0-100):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_SPEEDS.items()])
+    delay_config = "Typical movement durations (seconds):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_DELAYS.items()])
+    
     prompt = f"""You are controlling a robot car. This image shows detected objects with bounding boxes.
 
                 Your GOAL: Navigate toward the {target_class} (shown in GREEN bounding box).
@@ -103,34 +107,28 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
                 Current situation:
                 {target_info}{obstacles_info}{history_info}
 
-                Instructions:
-                1. The GREEN box shows your target {target_class}
-                2. Other colored boxes are obstacles to avoid
-                3. Target position: {target['position']} (left/center/right of image)
-                4. Target size: {'LARGE (close)' if target['area'] > img_width * img_height * 0.3 else 'MEDIUM (approaching)' if target['area'] > img_width * img_height * 0.15 else 'SMALL (far away)'}
+                Visual context:
+                - GREEN box: your target {target_class}
+                - Other colored boxes: obstacles to consider
+                - Target position: {target['position']} (left/center/right of image)
+                - Target size: {'LARGE (close)' if target['area'] > img_width * img_height * 0.3 else 'MEDIUM (approaching)' if target['area'] > img_width * img_height * 0.15 else 'SMALL (far away)'}
+
+                {speed_config}
+                {delay_config}
 
                 Respond with EXACTLY this format: <decision> <speed> <duration>
 
-                Examples:
-                - "forward 80 1.5" = move forward at speed 80 for 1.5 seconds
-                - "left 60 1.0" = turn left at speed 60 for 1.0 seconds  
-                - "stop 0 0" = stop (reached target)
+                Example responses (use as format reference only):
+                - "forward 100 2.0" = move forward at speed 100 for 2.0 seconds
+                - "left 60 0.5" = turn left at speed 60 for 0.5 seconds  
+                - "right 80 1.5" = turn right at speed 80 for 1.5 seconds
+                - "stop 0 0" = stop moving
 
-                Decision rules:
-                - If target is LARGE and centered: "stop 0 0"
-                - If target is centered but MEDIUM/FAR: "forward 80 1.5" or "forward 100 2.0" (faster/longer if far)
-                - If target is on the LEFT (any distance): 
-                  - if close -> "left 60 1" (turn left to face it)
-                  - if FAR   ->  "forward 80 1.5" 
-                - If target is on the RIGHT (any distance): 
-                  - if close -> "right 60 1" (turn right to face it)
-                  - if FAR   ->  "forward 80 1.5" 
-                - If obstacles block path: "right 70 0.8" or "left 70 0.8" (quick dodge to avoid)
+                Available decisions: forward, left, right, stop, back
+                Speed range: 0-100
+                Duration range: 0.1-3.0 seconds
 
-                IMPORTANT: Always turn toward the target if it's not centered!
-                Forward movements MUST use at least 1.0 second duration (preferably 1.5-2.0s)
-                Speed range: 40-100 (higher = faster)
-                Duration range: 0.5-1.0s for turns, 1.0-2.5s for forward movements"""
+                Analyze the image and your recent history to decide the best action."""
 
     # Query AI
     response = query_ollama_vision(annotated_img, prompt)
@@ -146,31 +144,80 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
     return decision, speed, duration
 
 
-def ai_search_decision(annotated_img, target_class, other_objects, img_width, img_height, decision_history=None):
+def ai_search_decision(sock, og_annotated_img, model, target_class, capture_callback, reconnect_callback, decision_history=None):
     """
     Use AI to decide search strategy when target is not detected.
+    Rotates camera left/right, captures images, and asks AI which direction to turn.
     
     Args:
-        annotated_img: Image with bounding boxes drawn
-        target_class: Name of target class being searched for (e.g., 'chair')
-        other_objects: List of detected objects (not the target)
-        img_width: Image width in pixels
-        img_height: Image height in pixels
+        sock: Robot socket connection
+        og_annotated_img: Original annotated image (to restore display)
+        model: YOLO model
+        target_class: Name of target class being searched for (e.g., 'chair','ball')
+        capture_callback: Function to capture new frame after rotation
+        reconnect_callback: Function that reconnects socket (takes sock, returns new sock)
         decision_history: List of recent AI decisions (for context)
     
     Returns:
-        tuple: (decision: str, speed: int, duration: float)
-               decision: 'left', 'right', 'forward'
-               speed: motor speed 0-100
+        tuple: (sock, direction: str, duration: float)
+               sock: Updated socket connection
+               direction: 'left', 'right', 'forward'
                duration: movement duration in seconds
     """
     # Import here to avoid circular dependency
     from ollama.ollama_vision import query_ollama_vision
     
-    obstacles_info = ""
-    if other_objects:
-        obstacles_info = f"\nOther objects visible: {len(other_objects)} - "
-        obstacles_info += ", ".join([f"{obj['class']}" for obj in other_objects[:3]])
+    logger.info(f"🤖 AI search: scanning for {target_class}...")
+    
+    # Rotate camera to left (150°) and check (1 command)
+    logger.debug("AI search: Scanning left (150°)...")
+    cmd(sock, 'rotate', at=150)
+    time.sleep(0.5)  # Wait for servo to rotate
+    
+    left_img = capture_callback()
+    if left_img is not None:
+        objects_left, annotated_left = detect_objects_yolo(left_img, model, target_class=target_class)
+        cv.imshow('Camera', annotated_left)  # Show left scan
+        cv.waitKey(1)
+    
+    # Reconnect after 1 command
+    logger.debug("Reconnecting after left scan...")
+    sock = reconnect_callback(sock)
+    if sock is None:
+        logger.error("Failed to reconnect during AI search")
+        return None, None, 1.0
+    
+    # Rotate camera to right (30°) and check (1 command)
+    logger.debug("AI search: Scanning right (30°)...")
+    cmd(sock, 'rotate', at=30)
+    time.sleep(0.5)  # Wait for servo to rotate
+    
+    right_img = capture_callback()
+    if right_img is not None:
+        objects_right, annotated_right = detect_objects_yolo(right_img, model, target_class=target_class)
+        cv.imshow('Camera', annotated_right)  # Show right scan
+        cv.waitKey(1)
+    
+    # Reconnect after 1 more command
+    logger.debug("Reconnecting after right scan...")
+    sock = reconnect_callback(sock)
+    if sock is None:
+        logger.error("Failed to reconnect during AI search")
+        return None, None, 1.0
+    
+    # Always return camera to center (90°) - MANDATORY (1 command)
+    logger.debug("Returning camera to center (90°)...")
+    cmd(sock, 'rotate', at=90)
+    cv.imshow('Camera', og_annotated_img)  # Restore original view
+    cv.waitKey(1)
+    time.sleep(0.5)
+    
+    # Reconnect before final robot movement
+    logger.debug("Reconnecting before robot movement...")
+    sock = reconnect_callback(sock)
+    if sock is None:
+        logger.error("Failed to reconnect during AI search")
+        return None, None, 1.0
     
     # Build decision history context
     history_info = ""
@@ -180,59 +227,87 @@ def ai_search_decision(annotated_img, target_class, other_objects, img_width, im
             history_info += f"{i}. {dec['decision']} ({dec['duration']:.1f}s)\n"
             if dec.get('all_objects'):
                 history_info += f"   Saw: {', '.join([obj['class'] for obj in dec['all_objects'][:3]])}\n"
-        history_info += "\nVary your search pattern if not finding the target!"
     
+    # Build movement configuration reference for AI
+    speed_config = "Available speeds (0-100):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_SPEEDS.items()])
+    delay_config = "Typical movement durations (seconds):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_DELAYS.items()])
+    
+    # Ask AI to decide based on both views
     prompt = f"""You are controlling a robot car searching for a {target_class}.
 
-                Current situation:
-                - Target {target_class} is NOT visible in current view{obstacles_info}{history_info}
+            The robot just scanned LEFT and RIGHT by rotating its camera. You have two images:
+            - LEFT image shows what robot sees when looking left
+            - RIGHT image shows what robot sees when looking right
 
-                Respond with EXACTLY this format: <decision> <speed> <duration>
+            Current situation:
+            - Target {target_class} is NOT visible in either direction{history_info}
 
-                Examples:
-                - "right 60 1.5" = rotate right at speed 60 for 1.5 seconds to scan area
-                - "left 60 1.5" = rotate left at speed 60 for 1.5 seconds
-                - "forward 80 2.0" = move forward at speed 80 for 2.0 seconds to explore
+            {speed_config}
+            {delay_config}
 
-                Available search movements:
-                - left: rotate left to scan area
-                - right: rotate right to scan area  
-                - forward: move forward to explore
+            Respond with EXACTLY this format: <decision> <speed> <duration>
 
-                Decision strategy:
-                - If you see open space ahead: "forward 80 2.0" (explore new area with good speed)
-                - If the view is cluttered/blocked: "right 60 1.5" or "left 60 1.5" (rotate to search)
-                - Occasionally vary your search pattern
+            Example responses (use as format reference only):
+            - "left 60 1.0" = turn left at speed 60 for 1.0 seconds
+            - "right 80 0.8" = turn right at speed 80 for 0.8 seconds
+            - "forward 100 1.5" = move forward at speed 100 for 1.5 seconds
 
-                IMPORTANT: Forward movements MUST use at least 1.5 seconds duration
-                Speed range: 50-90 (use 60 for rotation, 80+ for forward exploration)
-                Duration range: 1.0-1.5s for rotations, 1.5-2.5s for forward exploration"""
+            Available search movements: left, right, forward
+            Speed range: 0-100
+            Duration range: 0.1-3.0 seconds
 
-    # Query AI
-    response = query_ollama_vision(annotated_img, prompt)
+            Analyze both images and your search history to decide the best exploration direction."""
+
+    # Combine both images side by side for AI to analyze
+    import numpy as np
+    if left_img is not None and right_img is not None:
+        # Resize to same height if needed
+        h1, w1 = annotated_left.shape[:2]
+        h2, w2 = annotated_right.shape[:2]
+        if h1 != h2:
+            scale = h1 / h2
+            annotated_right = cv.resize(annotated_right, (int(w2 * scale), h1))
+        
+        # Concatenate horizontally with labels
+        combined = np.hstack([annotated_left, annotated_right])
+        
+        # Add text labels
+        cv.putText(combined, "LEFT", (50, 50), cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+        cv.putText(combined, "RIGHT", (w1 + 50, 50), cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+        
+        # Query AI with combined image
+        response = query_ollama_vision(combined, prompt)
+    else:
+        logger.warning("Failed to capture both images for AI search")
+        response = None
     
     if response is None:
-        logger.warning("AI search decision failed, defaulting to right (search)")
-        return 'right', 60, 1.5
+        logger.warning("AI search decision failed, defaulting to right turn")
+        direction, speed, duration = 'right', 80, 1.0
+    else:
+        # Parse decision with parameters
+        direction, speed, duration = parse_ai_movement_response(response)
+        logger.info(f"🤖 AI search: {direction} (speed={speed}, duration={duration:.1f}s)")
+        
+        # Validate decision is valid for search mode
+        if direction not in ['left', 'right', 'forward']:
+            logger.warning(f"Invalid search decision '{direction}', defaulting to right")
+            direction, speed, duration = 'right', 80, 1.0
     
-    # Parse decision with parameters
-    decision, speed, duration = parse_ai_movement_response(response)
-    logger.info(f"🔍 AI search: {decision} (speed={speed}, duration={duration:.1f}s)")
+    # Execute the AI's decision (1 command: move with timed duration)
+    logger.info(f"AI search: executing {direction.upper()} movement")
+    cmd(sock, 'move', where=direction, at=speed)
+    time.sleep(duration)  # Wait for movement to complete (timed movement)
     
-    # Validate decision is valid for search mode
-    if decision not in ['left', 'right', 'forward']:
-        logger.warning(f"Invalid search decision '{decision}', defaulting to right")
-        return 'right', 60, 1.5
-    
-    return decision, speed, duration
+    return sock, direction, duration
 
 
 # Movement timing configuration
 MOVEMENT_DELAYS = {
     'forward': 2,        # After autonomous forward movement in navigation
     'back': 0.8,           # After backing up during obstacle avoidance
-    'left': 0.8,           # After left turns in navigation
-    'right': 0.6,          # After right turns in navigation
+    'left': 0.5,           # After left turns in navigation
+    'right': 0.5,          # After right turns in navigation
     'manual': 0.1,         # After manual arrow key controls
     'unstuck_back': 0.8,   # Initial backup in vision-based stuck recovery
     'unstuck_turn': 0.8,   # Turns during vision-based stuck recovery scanning
@@ -244,14 +319,18 @@ MOVEMENT_DELAYS = {
 # Can be overridden by importing module
 MOVEMENT_SPEEDS = {
     'forward_normal': 100,    # When exploring or no objects detected
-    'forward_close': 100,     # When approaching target or avoiding obstacles
-    'back_normal': 80,       # General backing up during obstacle avoidance
+
     'back_avoid': 80,        # Initial backup in vision-based stuck recovery
-    'left_normal': 50,       # Normal left turns  avoiding obstacles
+
+    'left_normal': 60,       # Normal left turns  avoiding obstacles
+    'right_normal': 60,      # Normal right turns  avoiding obstacles
+    
     'left_unstuck': 70,      # Left turns during vision-based stuck recovery scanning & positioning
-    'right_normal': 50,      # Normal right turns  avoiding obstacles
+    'right_unstuck':70,       # Right turns during vision-based stuck recovery scanning & positioning
+
     'right_avoid': 60,       # Right turns to avoid obstacles
-    'right_search': 100,     # Slow rotation when searching for target
+
+    'no_target_search': 60,     # Slow rotation when searching for target
     'default': 50,           # Fallback for any unspecified movement
     'target_on_sides': 80    # when target on right or left, but far away (area based) !
 }
@@ -374,7 +453,7 @@ def vision_based_stuck_recovery(sock, capture_callback, reconnect_callback):
         chosen = 'right'
         logger.info(f"✅ RIGHT path more open ({right_score:.2f} >= {left_score:.2f})")
         logger.info("Turning robot RIGHT...")
-        cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
+        cmd(sock, 'move', where='right', at=movement_speed('right_unstuck'))
         time.sleep(1.2)  # Turn right
         cmd(sock, 'stop')
     
@@ -431,29 +510,6 @@ def calculate_path_openness(image):
     return total_score
 
 
-def check_ultrasonic_distance(sock):
-    """
-    Read ultrasonic distance sensor and back up if too close.
-    Returns: distance in cm, or None if reading failed
-    """
-    distance = read_distance(sock)
-    if distance is not None:
-        logger.debug(f"\033[94mUltrasonic: {distance}cm\033[0m")  # Blue
-        
-        # If object is very close, back up
-        if distance < 20:
-            logger.warning(f"Object very close ({distance}cm), backing up!")
-            cmd(sock, 'move', where='back', at=movement_speed('back_avoid'))
-            import time
-            time.sleep(1)
-            cmd(sock, 'stop')
-        
-        return distance
-    else:
-        logger.warning("Failed to read ultrasonic sensor")
-        return None
-
-
 def ultrasonic_safety_check(sock, threshold=30):
     """
     Ultrasonic safety check before moving forward.
@@ -486,7 +542,7 @@ def ultrasonic_safety_check(sock, threshold=30):
     return True, distance  # Safe to proceed
 
 
-def smart_search_for_target(sock, img, model, target_class, capture_callback, reconnect_callback):
+def smart_search_for_target(sock, og_annotated_img, model, target_class, capture_callback, reconnect_callback):
     """
     Intelligently search for target by scanning left, center, right with camera rotation.
     Then moves robot based on where target was found.
@@ -512,7 +568,9 @@ def smart_search_for_target(sock, img, model, target_class, capture_callback, re
     left_img = capture_callback()
     chair_on_left = False
     if left_img is not None:
-        objects, _ = detect_objects_yolo(left_img, model, target_class=target_class)
+        objects, annotated_left = detect_objects_yolo(left_img, model, target_class=target_class)
+        cv.imshow('Camera', annotated_left)  # Show left scan
+        cv.waitKey(1)
         target_objects = [obj for obj in objects if obj['class'] == target_class]
         if target_objects:
             logger.info(f"✓ Target {target_class} found on LEFT!")
@@ -533,7 +591,9 @@ def smart_search_for_target(sock, img, model, target_class, capture_callback, re
     right_img = capture_callback()
     chair_on_right = False
     if right_img is not None:
-        objects, _ = detect_objects_yolo(right_img, model, target_class=target_class)
+        objects, annotated_right = detect_objects_yolo(right_img, model, target_class=target_class)
+        cv.imshow('Camera', annotated_right)  # Show right scan
+        cv.waitKey(1)
         target_objects = [obj for obj in objects if obj['class'] == target_class]
         if target_objects:
             logger.info(f"✓ Target {target_class} found on RIGHT!")
@@ -549,6 +609,8 @@ def smart_search_for_target(sock, img, model, target_class, capture_callback, re
     # Always return camera to center (90°) - MANDATORY (1 command)
     logger.debug("Returning camera to center (90°)...")
     cmd(sock, 'rotate', at=90)
+    cv.imshow('Camera', og_annotated_img)  # Show left scan
+    cv.waitKey(1)
     time.sleep(0.5)
     
     # Reconnect before final robot movement
@@ -558,32 +620,32 @@ def smart_search_for_target(sock, img, model, target_class, capture_callback, re
         logger.error("Failed to reconnect during smart search")
         return None, None
     
-    # Decide robot movement based on scan results (1 command)
+    # Decide robot movement based on scan results (1 command: move with timed duration)
     if chair_on_left:
         logger.info("Smart search: chair on left, turning robot left")
         cmd(sock, 'move', where='left', at=movement_speed('left_normal'))
+        time.sleep(MOVEMENT_DELAYS['left'])  # Wait for turn to complete (timed movement)
         return sock, 'left'
     elif chair_on_right:
         logger.info("Smart search: chair on right, turning robot right")
         cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
+        time.sleep(MOVEMENT_DELAYS['right'])  # Wait for turn to complete (timed movement)
         return sock, 'right'
     else:
         # Not found anywhere (center was already checked before smart search)
         logger.warning(f"✗ Target {target_class} not found in any direction")
-        if np.random.rand() < 0.5:
-            direction = 'left'
-        else:
-            direction = 'right'
+        direction = 'right'
         logger.info(f"Smart search: defaulting to turn {direction.upper()} to continue search")
-        cmd(sock, 'move', where=direction, at=movement_speed('right_search'))
+        cmd(sock, 'move', where=direction, at=movement_speed('no_target_search'))
+        time.sleep(MOVEMENT_DELAYS.get(direction, MOVEMENT_DELAYS['default']))  # Timed movement
         return sock, direction
 
 
 def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None):
     """
     Navigate the robot based on YOLO object detection.
-    - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair')
-    - avoid_classes: list of classes to avoid (e.g., ['person', 'chair', 'dog'])
+    - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair','ball')
+    - avoid_classes: list of classes to avoid (e.g., ['person', 'chair', 'dog','ball'])
     - ai_decide: if True, use AI decision (must provide ai_decision parameter)
     - ai_decision: Pre-computed AI decision string (if ai_decide=True)
     - objects: Pre-detected objects list (optional, will detect if not provided)
@@ -597,11 +659,10 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
     
     height, width = annotated_img.shape[:2]
     
-    if len(objects) == 0: # No objects detected --> call smart_search using 'searching'
-        
-        logger.info(" ")
-        logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-        cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
+    if len(objects) == 0: # No objects detected --> trigger smart_search in fcam.py
+        logger.info("No objects detected - will use smart search")
+        # Don't send movement command here - smart_search will handle it
+        # Just return signal to trigger smart search in fcam.py
         return ('searching', MOVEMENT_DELAYS['default'])
     
     # Filter for target class if specified
@@ -751,14 +812,12 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                     cmd(sock, 'move', where=where, at=speed)
                     return ('right', duration)
         else:
-            # Target not found - use smart search
+            # Target not found - trigger smart search in fcam.py
             logger.warning(f"Target {target_class} not in current view")
             
-            # Smart search is handled in fcam.py to have access to capture callback
-            # Just return searching action here
-            logger.warning(f"Searching for {target_class}...")
-            cmd(sock, 'move', where='right', at=movement_speed('right_search'))
-            return ('searching', MOVEMENT_DELAYS['right'])
+            # Don't send movement command here - smart_search will handle it
+            # Just return signal to trigger smart search in fcam.py
+            return ('searching', MOVEMENT_DELAYS['default'])
     
     # Avoid obstacles mode
     if avoid_classes:
@@ -788,7 +847,7 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
         else:
             # Obstacles far enough, can move forward
             logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-            cmd(sock, 'move', where='forward', at=movement_speed('forward_close'))
+            cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
             return ('forward', MOVEMENT_DELAYS['forward'])
     
     return ('idle', 0.3)
