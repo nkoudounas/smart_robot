@@ -616,15 +616,20 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide):
                         logger.info("🔍 Initiating smart search...")
                         from utils.navigation_utils import smart_search_for_target
                         
-                        # Smart search will rotate and check directions
-                        direction = smart_search_for_target(sock, img, model, 'chair', capture)
+                        # Smart search will rotate and check directions (handles reconnects internally)
+                        sock, direction = smart_search_for_target(sock, img, model, 'chair', capture, reconnect_robot)
+                        
+                        if sock is None:
+                            logger.error("Smart search failed - socket disconnected")
+                            paused = True
+                            continue
                         
                         if direction == 'left':
-                            # Chair found on left, stay there
+                            # Chair found on left, already turned
                             logger.info("Smart search: turning toward chair on left")
                             result = ('left', movement_delay('left'))
                         elif direction == 'right':
-                            # Chair found on right, already positioned
+                            # Chair found on right, already turned
                             logger.info("Smart search: turning toward chair on right")
                             result = ('right', movement_delay('right'))
                         elif direction == 'center':
@@ -634,15 +639,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide):
                         else:
                             # Not found anywhere, continue random search
                             logger.warning("Smart search: chair not found, continuing random search")
-                            cmd(sock, 'move', where='right', at=movement_speed('right_search'))
-                            result = ('searching', movement_delay('right'))
-                        
-                        # Reconnect after smart search movements
-                        sock = reconnect_robot(sock)
-                        if sock is None:
-                            logger.error("Failed to reconnect after smart search")
-                            paused = True
-                            continue
+                            result = ('forward', movement_delay('default'))
                     
                     # Store AI decision in history if AI mode is enabled
                     if ai_decide and ai_decision:
@@ -706,7 +703,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide):
                 if isinstance(result, tuple):
                     result, ai_duration = result
                 
-                if result and result != 'idle':
+                if result and result != 'idle': # update 2D plot
                     if result == 'ultrasonic_avoid':
                         # Ultrasonic avoid does back then right
                         # Duration uses the actual delays from MOVEMENT_DELAYS
@@ -717,12 +714,12 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide):
                         update_robot_position(result, duration=duration)
                     elif result in ['left', 'right', 'avoid_left', 'avoid_right', 'avoid_blocker', 'searching']:
                         cmd_type = result.replace('avoid_', '').replace('_blocker', '')
-                        if cmd_type == 'searching':
-                            # flip a coin to decide turn direction
-                            if np.random.rand() < 0.5:
-                                cmd_type = 'left'
-                            else:
-                                cmd_type = 'right'
+                        # if cmd_type == 'searching':
+                        #     # flip a coin to decide turn direction
+                        #     if np.random.rand() < 0.5:
+                        #         cmd_type = 'left'
+                        #     else:
+                        #         cmd_type = 'right'
                         duration = ai_duration if ai_duration else MOVEMENT_DELAYS.get(cmd_type, MOVEMENT_DELAYS['default'])
                         update_robot_position(cmd_type, duration=duration)
                 
@@ -795,5 +792,5 @@ def main(use_ollama=False, ai_decide=False):
 
 if __name__ == '__main__':
     use_ollama = False  # Deprecated: use full Ollama navigation
-    ai_decide = False    # NEW: Use AI for decision making with YOLO detection
+    ai_decide = True    # NEW: Use AI for decision making with YOLO detection
     main(use_ollama, ai_decide)
