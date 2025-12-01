@@ -47,6 +47,7 @@ from utils.depth_estimation import DepthEstimator
 from utils.video_logger import VideoLogger
 
 from utils.connection_utils import connect_to_robot,periodic_reconnect
+from utils.tts_utils import announce_target_found, speak
 
 # Global variables
 iteration_count = 0
@@ -60,6 +61,7 @@ robot_angle = 90.0  # degrees, 0=right, 90=up, 180=left, 270=down
 path_x = [0.0]
 path_y = [0.0]
 last_command = None
+last_nav_command = 'none'  # Track last navigation command for stuck detection
 
 # Obstacle tracking (objects detected by ultrasonic sensor)
 obstacle_x = []
@@ -77,6 +79,14 @@ previous_frame = None
 stuck_counter = 0
 STUCK_THRESHOLD = 3  # Number of similar frames before considering stuck
 PIXEL_DIFF_THRESHOLD = 0.02  # 2% pixel difference threshold
+
+# Stuck detection (consecutive forward movements with minimal area change)
+last_forward_objects = None
+last_forward_command_count = 0
+
+# Rule 3: Target confirmation configuration
+RULE3_ENABLED = True  # Enable/disable target confirmation
+RULE3_AREA_THRESHOLD = 0.15  # Minimum area ratio (15% of frame) to trigger confirmation
 
 # AI decision memory (track last N decisions)
 ai_decision_history = []
@@ -252,16 +262,107 @@ def mark_obstacle(distance_cm):
     logger.info(f"📍 Obstacle marked at ({obs_x:.2f}, {obs_y:.2f}), distance: {distance_cm}cm")
 
 
-def is_robot_stuck(current_frame):
+def is_robot_stuck(current_frame, last_nav_command='none', current_objects=None, target='chair', area_threshold=0.02):
     """
-    Detect if robot is stuck by comparing current frame with previous frame.
-    Returns: True if robot appears stuck (similar frames for multiple iterations)
+    Detect if robot is stuck using three rules:
+    
+    Rule 1 (Frame-based): Compare current frame with previous frame.
+    Returns True if robot appears stuck (similar frames for multiple iterations)
+    
+    Rule 2 (Object-based): Check for 2 consecutive 'forward' commands with same target 
+    object showing ±2% area change. This triggers vision-based stuck recovery.
+    
+    Rule 3 (Bottom-position): Large target object in bottom 40% of frame indicates 
+    robot is blocked by object at ground level (immediate collision).
+    
+    Args:
+        current_frame: Current camera frame
+        last_nav_command: Last navigation command executed
+        current_objects: Currently detected objects with areas
+        target: Target object class to track
+        area_threshold: Maximum allowed area change ratio (default: 0.02 = ±2%)
+    
+    Returns:
+        (is_stuck: bool, reason: str)
     """
     global previous_frame, stuck_counter
+    global last_forward_objects, last_forward_command_count
     
+    # Rule 3: Check if large target object is touching bottom edge of frame - REQUIRES USER CONFIRMATION
+    if RULE3_ENABLED and current_objects and last_nav_command == 'forward':
+        h, w = current_frame.shape[:2]
+        target_objects = [obj for obj in current_objects if obj['class'] == target]
+        
+        if target_objects:
+            largest_target = max(target_objects, key=lambda x: x['area'])
+            
+            # Check if object occupies significant area (configurable threshold) 
+            # AND bottom edge is very close to bottom of frame (no empty space below)
+            area_ratio = largest_target['area'] / (w * h)
+            
+            # Check if bottom edge touches or is very close to frame bottom
+            touches_bottom = False
+            if 'bbox' in largest_target:
+                # bbox format: [x1, y1, x2, y2]
+                y2 = largest_target['bbox'][3]  # Bottom edge of object
+                # Object must be within 5% of frame height from bottom (no gap)
+                distance_from_bottom = h - y2
+                gap_threshold = h * 0.05  # 5% of frame height
+                touches_bottom = distance_from_bottom <= gap_threshold
+                
+                logger.debug(f"Rule 3 check: y2={y2}, h={h}, gap={distance_from_bottom:.0f}px, threshold={gap_threshold:.0f}px, touches={touches_bottom}")
+            else:
+                # Fallback: if no bbox, can't reliably check bottom position
+                touches_bottom = False
+            
+            if area_ratio > RULE3_AREA_THRESHOLD and touches_bottom:
+                reason = f"Large {target} touching bottom ({area_ratio*100:.1f}% area, gap={distance_from_bottom:.0f}px) - awaiting user confirmation"
+                logger.warning(f"🎯 POSSIBLE TARGET REACHED! {reason}")
+                
+                # Reset forward tracking
+                last_forward_objects = None
+                last_forward_command_count = 0
+                return True, reason
+    
+    # Rule 2: Check consecutive forward commands with minimal area change
+    if last_nav_command == 'forward':
+        last_forward_command_count += 1
+        
+        # Check if we have 2 consecutive forwards with objects
+        if last_forward_command_count >= 2 and last_forward_objects and current_objects:
+            # Check if same objects detected (by class) with minimal area change
+            target_objects_now = [obj for obj in current_objects if obj['class'] == target]
+            target_objects_prev = [obj for obj in last_forward_objects if obj['class'] == target]
+            
+            if target_objects_now and target_objects_prev:
+                # Get largest target object from each
+                current_target = max(target_objects_now, key=lambda x: x['area'])
+                prev_target = max(target_objects_prev, key=lambda x: x['area'])
+                
+                # Calculate area change percentage
+                if prev_target['area'] > 0:
+                    area_change = abs(current_target['area'] - prev_target['area']) / prev_target['area']
+                    
+                    if area_change <= area_threshold:
+                        reason = f"2 consecutive forwards with {area_change*100:.1f}% area change (vision-based recovery)"
+                        logger.error(f"🚫 ROBOT STUCK DETECTED! {reason}")
+                        
+                        # Reset state after detection
+                        last_forward_objects = None
+                        last_forward_command_count = 0
+                        return True, reason
+        
+        # Update last forward objects for next check
+        last_forward_objects = current_objects.copy() if current_objects else None
+    else:
+        # Reset counter if not forward
+        last_forward_objects = None
+        last_forward_command_count = 0
+    
+    # Rule 1: Frame comparison (existing logic)
     if previous_frame is None:
         previous_frame = current_frame.copy()
-        return False
+        return False, "Not stuck"
     
     # Resize both frames to same size for comparison (in case of any mismatch)
     h, w = current_frame.shape[:2]
@@ -293,11 +394,12 @@ def is_robot_stuck(current_frame):
     
     # Return True if stuck for multiple frames
     if stuck_counter >= STUCK_THRESHOLD:
-        logger.error(f"🚫 ROBOT STUCK DETECTED! ({stuck_counter} similar frames)")
+        reason = f"{stuck_counter} similar frames (frame-based)"
+        logger.error(f"🚫 ROBOT STUCK DETECTED! {reason}")
         stuck_counter = 0  # Reset counter after detection
-        return True
+        return True, reason
     
-    return False
+    return False, "Not stuck"
 
 
 def mark_detected_objects(objects, image_width):
@@ -436,15 +538,16 @@ def update_plot(ax, target='chair'):
     plt.pause(0.001)  # Very short pause to update display
 
 
-def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capture_video=True):
+def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capture_video=True, target_confidence=0.75):
     """
     Main navigation loop with YOLO object detection.
     Args:
         capture_video: If True, record navigation video with logs (default: True)
+        target_confidence: Minimum confidence threshold for target detection (default: 0.75)
     Returns: final iteration count
     """
     # target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
-    global iteration_count, paused, video_logger
+    global iteration_count, paused, video_logger, last_nav_command
     
     logger.info("\nStarting autonomous navigation with YOLO...")
     logger.warning("\nNOTE: Robot firmware closes connection after 8 commands - auto-reconnecting every 3 iterations")
@@ -455,9 +558,9 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
     cv.resizeWindow('Camera', 800, 600)
     cv.moveWindow('Camera', 0, 0)
     
-    # Setup live plot
-    fig, ax = setup_live_plot()
-    update_plot(ax, target)  # Draw initial plot
+    # Setup live plot (DISABLED)
+    # fig, ax = setup_live_plot()
+    # update_plot(ax, target)  # Draw initial plot
     
     iteration_count = 0
     video_initialized = False  # Track if video has been initialized
@@ -485,7 +588,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
             # Skip iteration if paused
             if paused:
                 time.sleep(0.1)
-                update_plot(ax, target)  # Keep plot responsive
+                # update_plot(ax, target)  # Keep plot responsive (DISABLED)
                 continue
             
             # Check connection
@@ -528,9 +631,91 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                 video_initialized = True
                 logger.info("📹 Video recording disabled")
 
-            # Check if robot is stuck (same view for multiple frames)
-            if is_robot_stuck(img):
-                logger.error("🚨 Robot appears STUCK! Taking evasive action...")
+            # First, detect objects with YOLO to get annotated image with bounding boxes
+            from utils.detection_utils import detect_objects_yolo
+            objects, annotated_img = detect_objects_yolo(img, model, target_class=target)
+            
+            # Check if robot is stuck (frame-based and object-based rules)
+            # Rule 3 now requires user confirmation for target
+            is_stuck, stuck_reason = is_robot_stuck(img, last_nav_command, objects, target)
+            if is_stuck:
+                # Check if this is Rule 3 (possible target reached - needs confirmation)
+                if "awaiting user confirmation" in stuck_reason:
+                    speak("Type the secret word to confirm target reached")
+                    # speak("Παρακαλώ πληκτρολογήστε τη μυστική λέξη για να επιβεβαιώσετε ότι φτάσατε στον στόχο")
+
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"🎯 POSSIBLE TARGET REACHED!")
+                    logger.info(f"   {stuck_reason}")
+                    logger.info(f"   Iterations: {iteration_count}")
+                    logger.info(f"{'='*60}")
+                    logger.info(f"\n⌨️  Type the secret word to confirm target reached, or press 'r' to resume navigation\n")
+                    
+                    # Stop robot
+                    if check_connection(sock):
+                        cmd(sock, 'stop')
+                    
+                    # Log to video
+                    if video_logger and video_logger.is_recording:
+                        video_logger.add_log(f"🎯 Awaiting user confirmation for {target}", "INFO")
+                    
+                    # Wait for user input
+                    paused = True
+                    waiting_for_confirmation = True
+                    
+                    while waiting_for_confirmation:
+                        cv.imshow('Camera', annotated_img)
+                        key = cv.waitKey(100) & 0xFF
+                        
+                        # Check for 'r' to resume
+                        if key == ord('r'):
+                            logger.info("\n❌ User cancelled - resuming navigation")
+                            if video_logger and video_logger.is_recording:
+                                video_logger.add_log("User cancelled - resuming", "WARNING")
+                            paused = False
+                            waiting_for_confirmation = False
+                            last_nav_command = 'none'
+                            break
+                        
+                        # Check for 'k' to exit
+                        elif key == ord('k'):
+                            logger.warning("\n'k' pressed - Stopping and exiting...")
+                            if check_connection(sock):
+                                cmd(sock, 'stop')
+                            waiting_for_confirmation = False
+                            return iteration_count
+                        
+                        # Check terminal for 'flag' input
+                        import sys
+                        import select
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            user_input = sys.stdin.readline().strip().lower()
+                            if user_input == 'flag':
+                                logger.info(f"\n{'='*60}")
+                                logger.info(f"🏆 SUCCESS! Flag captured!")
+                                logger.info(f"   Target: {target}")
+                                logger.info(f"   Total iterations: {iteration_count}")
+                                logger.info(f"{'='*60}\n")
+                                
+                                # Announce via TTS
+                                from utils.tts_utils import announce_target_reached
+                                announce_target_reached(target)
+                                
+                                if video_logger and video_logger.is_recording:
+                                    video_logger.add_log(f"🏆 FLAG CAPTURED! Target: {target}", "SUCCESS")
+                                
+                                logger.info("Press 'k' to exit or 'r' to restart")
+                                waiting_for_confirmation = False
+                                # Stay paused until user exits or restarts
+                            else:
+                                logger.warning(f"❌ Incorrect input: '{user_input}' - Type 'flag' to confirm or press 'r' to resume")
+                    
+                    # Reset last nav command
+                    last_nav_command = 'none'
+                    continue
+                
+                # Rules 1 & 2: Real stuck detection - use vision-based recovery
+                logger.error(f"🚨 Robot appears STUCK! Reason: {stuck_reason}")
                 
                 # Use vision-based recovery to intelligently choose escape direction
                 from utils.navigation_utils import vision_based_stuck_recovery
@@ -567,13 +752,12 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                         paused = True
                         continue
                 
+                # Reset last nav command after recovery
+                last_nav_command = 'none'
+                
                 # Skip navigation this iteration
-                update_plot(ax, target)
+                # update_plot(ax, target)  # (DISABLED)
                 continue
-
-            # First, detect objects with YOLO to get annotated image with bounding boxes
-            from utils.detection_utils import detect_objects_yolo
-            objects, annotated_img = detect_objects_yolo(img, model, target_class=target)
             
             # Log all detected objects with their labels and probabilities
             if objects:
@@ -621,9 +805,10 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                     
                     # If AI decision mode is enabled, compute decision BEFORE calling navigate
                     ai_decision = None
-                    target_objects = [obj for obj in objects if obj['class'] == target]
                     
                     if ai_decide:
+                        # AI mode: NO confidence filtering - AI sees all detections and judges quality itself
+                        target_objects = [obj for obj in objects if obj['class'] == target]
                         # Find target and compute AI decision
                         if target_objects:
                             target_obj = max(target_objects, key=lambda x: x['area'])
@@ -652,9 +837,11 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                                 continue
                     
                     # Now navigate with YOLO (with pre-computed AI decision if enabled)
+                    # Pass target_confidence to navigate_with_yolo for hardcoded mode filtering
                     result = navigate_with_yolo(sock, annotated_img, model, target_class=target, avoid_classes=None, 
                                               ai_decide=ai_decide, ai_decision=ai_decision,
-                                              objects=objects, annotated_img=annotated_img, video_logger=video_logger)
+                                              objects=objects, annotated_img=annotated_img, video_logger=video_logger,
+                                              target_confidence=target_confidence)
                     
                     # If searching (no target found), use smart search
                     if result and result[0] == 'searching':
@@ -662,7 +849,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                         if video_logger and video_logger.is_recording:
                             video_logger.add_log("🔍 Initiating smart search", "INFO")
                         
-                        if ai_decide or False:
+                        if False and ai_decide: # AI search disabled - always use smart_search (AI search too slow)
                             # Use AI-based search decision
                             from utils.navigation_utils import ai_search_decision
                             sock, direction, duration = ai_search_decision(sock, annotated_img, model, target, capture, reconnect_robot, decision_history=ai_decision_history)
@@ -756,6 +943,22 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                 if isinstance(result, tuple):
                     result, ai_duration = result
                 
+                # Track last navigation command for stuck detection
+                if result and result != 'idle':
+                    # Extract base command (forward, back, left, right)
+                    if result == 'ultrasonic_avoid':
+                        last_nav_command = 'back'  # Primary movement
+                    elif result in ['forward', 'back', 'left', 'right']:
+                        last_nav_command = result
+                    elif result in ['avoid_left', 'avoid_blocker']:
+                        last_nav_command = 'left'
+                    elif result == 'avoid_right':
+                        last_nav_command = 'right'
+                    elif result == 'searching':
+                        last_nav_command = 'searching'
+                    else:
+                        last_nav_command = 'none'
+                
                 if result and result != 'idle': # update 2D plot
                     if result == 'ultrasonic_avoid':
                         # Ultrasonic avoid does back then right
@@ -776,8 +979,8 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                         duration = ai_duration if ai_duration else MOVEMENT_DELAYS.get(cmd_type, MOVEMENT_DELAYS['default'])
                         update_robot_position(cmd_type, duration=duration)
                 
-                # Update live plot
-                update_plot(ax, target)
+                # Update live plot (DISABLED)
+                # update_plot(ax, target)
                 
                 # Write frame to video if recording
                 if video_logger and video_logger.is_recording:
@@ -836,7 +1039,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
     return iteration_count
 
 
-def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False, capture_video=True):
+def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False, capture_video=True, target_confidence=0.75, rule3_enabled=True, rule3_area_threshold=0.15):
     """Main entry point
     
     Args:
@@ -845,7 +1048,17 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
         target: YOLO class name to search for (e.g., 'chair', 'ball', 'person')
         use_segmentation: If True, use YOLO segmentation model (yolo11l-seg.pt)
         capture_video: If True, record navigation video with logs (default: True)
+        target_confidence: Minimum confidence threshold for target detection (default: 0.75)
+        rule3_enabled: If True, enable Rule 3 target confirmation (default: True)
+        rule3_area_threshold: Minimum area ratio (0.0-1.0) to trigger Rule 3 (default: 0.15 = 15%)
     """
+    # Configure Rule 3
+    global RULE3_ENABLED, RULE3_AREA_THRESHOLD
+    RULE3_ENABLED = rule3_enabled
+    RULE3_AREA_THRESHOLD = rule3_area_threshold
+    
+    logger.info(f"Rule 3 configuration: enabled={RULE3_ENABLED}, area_threshold={RULE3_AREA_THRESHOLD*100:.0f}%")
+    
     # Initialize YOLO model - use segmentation if requested
     if use_segmentation:
         model_name = 'yolo11x-seg.pt'  # Large segmentation model
@@ -858,7 +1071,7 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
     sock = connect_to_robot()
     
     # Run navigation loop
-    final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide, target, capture_video=capture_video)
+    final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide, target, capture_video=capture_video, target_confidence=target_confidence)
     
     logger.info(f"\nTotal iterations completed: {final_iterations}")
     logger.info("Program ended")
@@ -866,8 +1079,16 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
 
 if __name__ == '__main__':
     use_ollama = False  # Deprecated: use full Ollama navigation
-    ai_decide =  True    # NEW: Use AI for decision making with YOLO detection
+    ai_decide =  False    # NEW: Use AI for decision making with YOLO detection
     target = 'chair'     # Target object class to search for
     use_segmentation = True  # Use YOLO segmentation model for better object understanding
     capture_video = True  # Record navigation video with logs
-    main(use_ollama, ai_decide, target, use_segmentation, capture_video)
+    target_confidence = 0.60  # Minimum confidence threshold for target detection
+    
+    # Rule 3: Target confirmation configuration
+    rule3_enabled = True  # Enable target confirmation when close to object
+    rule3_area_threshold = 0.20  # 30% of frame area to trigger confirmation (closer proximity required)
+    
+    main(use_ollama, ai_decide, target, use_segmentation,
+          capture_video, target_confidence,
+          rule3_enabled, rule3_area_threshold)

@@ -9,7 +9,7 @@ import re
 import numpy as np
 from .detection_utils import detect_objects_yolo, get_largest_object
 from .robot_utils import cmd, read_distance, read_ir_sensors
-
+from .tts_utils import speak
 # Setup logger
 logger = colorlog.getLogger(__name__)
 
@@ -44,13 +44,13 @@ def parse_ai_movement_response(response):
         # Fallback: try to extract just the decision word
         words = response.lower().split()
         for word in words:
-            if word in ['forward', 'left', 'right', 'stop', 'avoid', 'backward', 'rotate_left', 'rotate_right']:
+            if word in ['forward', 'left', 'right', 'back', 'backward']:
                 logger.warning(f"AI response didn't match format, extracted '{word}' with defaults")
                 return word, 60, 1.0
         
         # Ultimate fallback
         logger.error(f"Could not parse AI response: {response}")
-        return 'stop', 0, 0
+        return 'forward', 60, 1.0
 
 
 def ai_navigation_decision(annotated_img, target, other_objects, target_class, img_width, img_height, decision_history=None):
@@ -68,7 +68,7 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
     
     Returns:
         tuple: (decision: str, speed: int, duration: float)
-               decision: 'forward', 'left', 'right', 'stop', 'avoid'
+               decision: 'forward', 'left', 'right', 'stop', 'back'
                speed: motor speed 0-100
                duration: movement duration in seconds
     """
@@ -96,10 +96,6 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
                 history_info += "\n"
         history_info += "\nAnalyze: Are you making progress? Is target getting larger/more centered? Try different approach if stuck!"
     
-    # Build movement configuration reference for AI
-    speed_config = "Available speeds (0-100):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_SPEEDS.items()])
-    delay_config = "Typical movement durations (seconds):\n" + "\n".join([f"    - {k}: {v}" for k, v in MOVEMENT_DELAYS.items()])
-    
     prompt = f"""You are controlling a robot car. This image shows detected objects with bounding boxes.
 
                 Your GOAL: Navigate toward the {target_class} (shown in GREEN bounding box).
@@ -109,12 +105,20 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
 
                 Visual context:
                 - GREEN box: your target {target_class}
-                - Other colored boxes: obstacles to consider
+                - Other colored boxes: obstacles to avoid
                 - Target position: {target['position']} (left/center/right of image)
                 - Target size: {'LARGE (close)' if target['area'] > img_width * img_height * 0.3 else 'MEDIUM (approaching)' if target['area'] > img_width * img_height * 0.15 else 'SMALL (far away)'}
+                
+                ⚠️ IMPORTANT: YOLO detection confidence: {target.get('confidence', 0)*100:.0f}%
+                YOLO may misclassify objects! Use your visual understanding of the image to verify:
+                - Does the GREEN box actually look like a {target_class}?
+                - Are the bounding boxes accurate?
+                - Consider both YOLO labels AND what you see in the image
 
-                {speed_config}
-                {delay_config}
+                Movement guidelines (these are behavior names, NOT commands):
+                • Slow careful movement (40-60 speed, 0.3-0.8s) - for tight spaces or close objects
+                • Normal movement (60-80 speed, 0.5-1.5s) - for general navigation  
+                • Fast movement (80-100 speed, 1.0-2.5s) - for open spaces or far targets
 
                 Respond with EXACTLY this format: <decision> <speed> <duration>
 
@@ -122,11 +126,15 @@ def ai_navigation_decision(annotated_img, target, other_objects, target_class, i
                 - "forward 100 2.0" = move forward at speed 100 for 2.0 seconds
                 - "left 60 0.5" = turn left at speed 60 for 0.5 seconds  
                 - "right 80 1.5" = turn right at speed 80 for 1.5 seconds
-                - "stop 0 0" = stop moving
+                - "back 80 0.8" = move backward at speed 80 for 0.8 seconds
 
-                Available decisions: forward, left, right, stop, back
+                Available decisions: forward, left, right, back
                 Speed range: 0-100
                 Duration range: 0.1-3.0 seconds
+
+                OBSTACLE AVOIDANCE:
+                If obstacles block your path to the target, choose LEFT or RIGHT to navigate around them.
+                Use appropriate speed (40-80) and duration (0.5-1.5s) based on obstacle size and position.
 
                 Analyze the image and your recent history to decide the best action."""
 
@@ -304,13 +312,13 @@ def ai_search_decision(sock, og_annotated_img, model, target_class, capture_call
 
 # Movement timing configuration
 MOVEMENT_DELAYS = {
-    'forward': 2,        # After autonomous forward movement in navigation
+    'forward': 1,        # After autonomous forward movement in navigation
     'back': 0.8,           # After backing up during obstacle avoidance
-    'left': 0.5,           # After left turns in navigation
-    'right': 0.5,          # After right turns in navigation
+    'left': 0.3,           # After left turns in navigation
+    'right': 0.3,          # After right turns in navigation
     'manual': 0.1,         # After manual arrow key controls
-    'unstuck_back': 0.8,   # Initial backup in vision-based stuck recovery
-    'unstuck_turn': 0.8,   # Turns during vision-based stuck recovery scanning
+    'unstuck_back': 0.5,   # Initial backup in vision-based stuck recovery
+    'unstuck_turn': 0.5,   # Turns during vision-based stuck recovery scanning
     'default': 1.0,         # Main loop delay between navigation iterations (longer for AI decisions)
     'target_on_sides': 1.5   # when target on right or left, but far away (area based) !
 }
@@ -318,15 +326,13 @@ MOVEMENT_DELAYS = {
 # Movement speed configuration (0-100)
 # Can be overridden by importing module
 MOVEMENT_SPEEDS = {
-    'forward_normal': 100,    # When exploring or no objects detected
-
-    'back_avoid': 80,        # Initial backup in vision-based stuck recovery
-
+    'forward_normal': 150,    # When exploring or no objects detected
     'left_normal': 60,       # Normal left turns  avoiding obstacles
     'right_normal': 60,      # Normal right turns  avoiding obstacles
-    
-    'left_unstuck': 70,      # Left turns during vision-based stuck recovery scanning & positioning
-    'right_unstuck':70,       # Right turns during vision-based stuck recovery scanning & positioning
+
+    'back_avoid': 80,    # Initial backup in vision-based stuck recovery
+    'left_unstuck': 70,      # vision-based stuck recovery scanning & positioning
+    'right_unstuck':70,      # vision-based stuck recovery scanning & positioning
 
     'right_avoid': 60,       # Right turns to avoid obstacles
 
@@ -402,7 +408,7 @@ def vision_based_stuck_recovery(sock, capture_callback, reconnect_callback):
     time.sleep(0.3)  # Stabilize
     
     # Step 2: Rotate camera left and capture (1 command)
-    logger.info("Step 2: Scanning LEFT (camera rotation 60°)...")
+    logger.info("Step 2: Scanning LEFT (camera rotation 150°)...")
     cmd(sock, 'rotate', at=150)  # Rotate camera/ultrasonic servo left (safe range)
     time.sleep(0.4)  # Wait for servo to settle
     left_image = capture_callback()
@@ -415,7 +421,7 @@ def vision_based_stuck_recovery(sock, capture_callback, reconnect_callback):
         return None, None, 0.0, 0.0
     
     # Step 3: Rotate camera right and capture (1 command)
-    logger.info("Step 3: Scanning RIGHT (camera rotation -60°)...")
+    logger.info("Step 3: Scanning RIGHT (camera rotation 30°)...")
     cmd(sock, 'rotate', at=30)  # Rotate camera/ultrasonic servo right (safe range)
     time.sleep(0.4)  # Wait for servo to settle
     right_image = capture_callback()
@@ -634,6 +640,8 @@ def smart_search_for_target(sock, og_annotated_img, model, target_class, capture
     else:
         # Not found anywhere (center was already checked before smart search)
         logger.warning(f"✗ Target {target_class} not found in any direction")
+        
+        # speak(f'Target {target_class} not found in any direction')
         direction = 'right'
         logger.info(f"Smart search: defaulting to turn {direction.upper()} to continue search")
         cmd(sock, 'move', where=direction, at=movement_speed('no_target_search'))
@@ -641,7 +649,7 @@ def smart_search_for_target(sock, og_annotated_img, model, target_class, capture
         return sock, direction
 
 
-def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None, video_logger=None):
+def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, ai_decide=False, ai_decision=None, objects=None, annotated_img=None, video_logger=None, target_confidence=0.75):
     """
     Navigate the robot based on YOLO object detection.
     - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair','ball')
@@ -651,6 +659,7 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
     - objects: Pre-detected objects list (optional, will detect if not provided)
     - annotated_img: Pre-annotated image (optional, will annotate if not provided)
     - video_logger: VideoLogger instance for recording logs to video (optional)
+    - target_confidence: Confidence threshold for hardcoded mode (default: 0.75, not used in AI mode)
     """
     # Vision-based navigation
     if objects is None or annotated_img is None:
@@ -666,13 +675,19 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
         # Just return signal to trigger smart search in fcam.py
         return ('searching', MOVEMENT_DELAYS['default'])
     
-    # Filter for target class if specified
+    # Capture the flag (target) mode
     if target_class:
-        target_objects = [obj for obj in objects if obj['class'] == target_class]
+        # Hardcoded mode: Apply confidence threshold for safety (AI mode already filtered in fcam.py)
+        if not ai_decide:
+            target_objects = [obj for obj in objects if obj['class'] == target_class and obj['confidence'] >= target_confidence]
+        else:
+            # AI mode: use pre-filtered objects (no additional filtering here)
+            target_objects = [obj for obj in objects if obj['class'] == target_class]       
         logger.debug(f"🔍 DEBUG: Looking for '{target_class}', found {len(objects)} total objects")
         logger.debug(f"🔍 DEBUG: Object classes: {[obj['class'] for obj in objects]}")
         logger.debug(f"🔍 DEBUG: Matching target objects: {len(target_objects)}")
         if target_objects:
+            # speak(f"Detected flag: {target_class}. ")
             # Find largest target object
             target = max(target_objects, key=lambda x: x['area'])
             
@@ -711,11 +726,11 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                     logger.debug(f"\033[96m→ Turning RIGHT (speed={speed}, delay={duration:.1f}s)\033[0m")
                     cmd(sock, 'move', where='right', at=speed)
                     return ('right', duration)
-                elif decision == 'avoid':
-                    logger.warning(f"AI: Avoiding obstacle (speed={speed}, duration={duration:.1f}s)")
-                    logger.debug(f"\033[96m→ Avoiding (speed={speed}, delay={duration:.1f}s)\033[0m")
-                    cmd(sock, 'move', where='right', at=speed)
-                    return ('avoid_blocker', duration)
+                elif decision == 'back':
+                    logger.info(f"AI: Moving backward (speed={speed}, duration={duration:.1f}s)")
+                    logger.debug(f"\033[93m↓ Moving BACKWARD (speed={speed}, delay={duration:.1f}s)\033[0m")
+                    cmd(sock, 'move', where='back', at=speed)
+                    return ('back', duration)
                 else:
                     # Fallback to stop if AI returns unexpected decision
                     logger.warning(f"AI returned unexpected decision: {decision}, stopping")
