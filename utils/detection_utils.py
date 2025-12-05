@@ -161,6 +161,54 @@ def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
     except Exception as e:
         print(f"ERROR processing YOLO results: {e}")
     
+    # Count objects by class
+    class_counts = {}
+    for obj in objects:
+        class_name = obj['class']
+        class_counts[class_name] = class_counts.get(class_name, 0) + 1
+    
+    # Draw object counts in top-right corner
+    font = cv.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    font_thickness = 2
+    padding = 10
+    line_height = 25
+    
+    # Sort by count (descending) then alphabetically
+    sorted_classes = sorted(class_counts.items(), key=lambda x: (-x[1], x[0]))
+    
+    # Calculate total height needed for background
+    total_lines = len(sorted_classes)
+    if total_lines == 0:
+        return objects, img
+    
+    # Find maximum text width for background rectangle
+    max_text_width = 0
+    for class_name, count in sorted_classes:
+        count_text = f"{count}x {class_name}"
+        (text_width, text_height), _ = cv.getTextSize(count_text, font, font_scale, font_thickness)
+        max_text_width = max(max_text_width, text_width)
+    
+    # Position in top-right corner
+    x_pos = width - max_text_width - padding * 2
+    y_start = padding
+    
+    # Draw semi-transparent black background for all text
+    overlay = img.copy()
+    bg_height = total_lines * line_height + padding
+    cv.rectangle(overlay, 
+                 (x_pos - 5, y_start),
+                 (width - padding, y_start + bg_height),
+                 (0, 0, 0), -1)
+    img = cv.addWeighted(overlay, 0.6, img, 0.4, 0)
+    
+    # Draw each class count
+    y_pos = y_start + 20
+    for class_name, count in sorted_classes:
+        count_text = f"{count}x {class_name}"
+        cv.putText(img, count_text, (x_pos, y_pos), font, font_scale, (255, 255, 255), font_thickness)
+        y_pos += line_height
+    
     return objects, img
 
 

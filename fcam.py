@@ -63,10 +63,6 @@ path_y = [0.0]
 last_command = None
 last_nav_command = 'none'  # Track last navigation command for stuck detection
 
-# Obstacle tracking (objects detected by ultrasonic sensor)
-obstacle_x = []
-obstacle_y = []
-
 # Detected objects tracking (vision-based with depth estimation)
 # Each entry: {'x': x, 'y': y, 'class': class_name, 'age': frames_old, 'confidence': float}
 detected_objects = []
@@ -241,25 +237,7 @@ def update_robot_position(command, duration=0.5):
     path_y.append(robot_y)
 
 
-def mark_obstacle(distance_cm):
-    """
-    Mark obstacle position based on current robot position and direction.
-    Distance is measured by ultrasonic sensor in cm.
-    """
-    global obstacle_x, obstacle_y
-    
-    # Convert distance to meters and calculate obstacle position
-    distance_m = distance_cm / 100.0
-    
-    # Obstacle is in front of robot (in direction of robot_angle)
-    obs_x = robot_x + distance_m * np.cos(np.radians(robot_angle))
-    obs_y = robot_y + distance_m * np.sin(np.radians(robot_angle))
-    
-    # Add to obstacle list
-    obstacle_x.append(obs_x)
-    obstacle_y.append(obs_y)
-    
-    logger.info(f"📍 Obstacle marked at ({obs_x:.2f}, {obs_y:.2f}), distance: {distance_cm}cm")
+
 
 
 def is_robot_stuck(current_frame, last_nav_command='none', current_objects=None, target='chair', area_threshold=0.02):
@@ -506,11 +484,6 @@ def update_plot(ax, target='chair'):
                   alpha=alpha, edgecolors='white', linewidths=1.5, zorder=4,
                   label=f"{obj['class']}" if obj['age'] == 0 else "")
     
-    # Plot obstacles detected by ultrasonic sensor (red X)
-    if len(obstacle_x) > 0:
-        ax.scatter(obstacle_x, obstacle_y, c='red', marker='x', s=100, linewidths=3, 
-                  label=f'Ultrasonic obstacles ({len(obstacle_x)})', zorder=5)
-    
     # Plot path
     if len(path_x) > 1:
         ax.plot(path_x, path_y, 'b-', alpha=0.5, linewidth=2, label='Path')
@@ -559,8 +532,8 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
     cv.moveWindow('Camera', 0, 0)
     
     # Setup live plot (DISABLED)
-    # fig, ax = setup_live_plot()
-    # update_plot(ax, target)  # Draw initial plot
+    fig, ax = setup_live_plot()
+    update_plot(ax, target)  # Draw initial plot
     
     iteration_count = 0
     video_initialized = False  # Track if video has been initialized
@@ -588,7 +561,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
             # Skip iteration if paused
             if paused:
                 time.sleep(0.1)
-                # update_plot(ax, target)  # Keep plot responsive (DISABLED)
+                update_plot(ax, target)  # Keep plot responsive (DISABLED)
                 continue
             
             # Check connection
@@ -604,7 +577,6 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                 logger.info(f"\n--- Iteration {iteration_count} ---")
             
             # Periodic reconnect to prevent firmware timeout
-            # Use threshold=2 because navigation may use up to 2 commands (ultrasonic + move)
             new_sock = periodic_reconnect(sock, threshold=2)
             if new_sock is None:
                 logger.error("Press 'r' to retry or 'k' to exit")
@@ -756,7 +728,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                 last_nav_command = 'none'
                 
                 # Skip navigation this iteration
-                # update_plot(ax, target)  # (DISABLED)
+                update_plot(ax, target)  # (DISABLED)
                 continue
             
             # Log all detected objects with their labels and probabilities
@@ -928,15 +900,6 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                         paused = True
                         continue
                 
-                # If ultrasonic triggered, we used 3 commands - reconnect immediately
-                if result == 'ultrasonic_avoid':
-                    logger.warning(f"\n[Ultrasonic avoid used 3 commands - reconnecting]")
-                    sock = reconnect_robot(sock)
-                    if sock is None:
-                        logger.error("Failed to reconnect after ultrasonic avoid")
-                        paused = True
-                        continue
-                
                 # Update position estimate based on navigation result
                 # AI mode returns tuple (result, duration), hardcoded mode returns string
                 ai_duration = None
@@ -946,30 +909,19 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                 # Track last navigation command for stuck detection
                 if result and result != 'idle':
                     # Extract base command (forward, back, left, right)
-                    if result == 'ultrasonic_avoid':
-                        last_nav_command = 'back'  # Primary movement
-                    elif result in ['forward', 'back', 'left', 'right']:
+                    if result in ['forward', 'back', 'left', 'right']:
                         last_nav_command = result
-                    elif result in ['avoid_left', 'avoid_blocker']:
-                        last_nav_command = 'left'
-                    elif result == 'avoid_right':
-                        last_nav_command = 'right'
                     elif result == 'searching':
                         last_nav_command = 'searching'
                     else:
                         last_nav_command = 'none'
                 
                 if result and result != 'idle': # update 2D plot
-                    if result == 'ultrasonic_avoid':
-                        # Ultrasonic avoid does back then right
-                        # Duration uses the actual delays from MOVEMENT_DELAYS
-                        update_robot_position('back', duration=MOVEMENT_DELAYS['back'])
-                        update_robot_position('right', duration=MOVEMENT_DELAYS['right'])
-                    elif result in ['forward', 'back']:
+                    if result in ['forward', 'back']:
                         duration = ai_duration if ai_duration else MOVEMENT_DELAYS[result]
                         update_robot_position(result, duration=duration)
-                    elif result in ['left', 'right', 'avoid_left', 'avoid_right', 'avoid_blocker', 'searching']:
-                        cmd_type = result.replace('avoid_', '').replace('_blocker', '')
+                    elif result in ['left', 'right', 'searching']:
+                        cmd_type = result
                         # if cmd_type == 'searching':
                         #     # flip a coin to decide turn direction
                         #     if np.random.rand() < 0.5:
@@ -980,7 +932,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
                         update_robot_position(cmd_type, duration=duration)
                 
                 # Update live plot (DISABLED)
-                # update_plot(ax, target)
+                update_plot(ax, target)
                 
                 # Write frame to video if recording
                 if video_logger and video_logger.is_recording:
@@ -1039,7 +991,7 @@ def run_navigation_loop(sock, model, use_ollama, ai_decide, target='chair', capt
     return iteration_count
 
 
-def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False, capture_video=True, target_confidence=0.75, rule3_enabled=True, rule3_area_threshold=0.15):
+def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=False, capture_video=True, target_confidence=0.75, rule3_enabled=True, rule3_area_threshold=0.15, robot_ip='192.168.4.1', robot_port=100):
     """Main entry point
     
     Args:
@@ -1051,6 +1003,8 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
         target_confidence: Minimum confidence threshold for target detection (default: 0.75)
         rule3_enabled: If True, enable Rule 3 target confirmation (default: True)
         rule3_area_threshold: Minimum area ratio (0.0-1.0) to trigger Rule 3 (default: 0.15 = 15%)
+        robot_ip: IP address of robot (default: '192.168.4.1')
+        robot_port: Port number of robot (default: 100)
     """
     # Configure Rule 3
     global RULE3_ENABLED, RULE3_AREA_THRESHOLD
@@ -1068,7 +1022,7 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
     model = initialize_yolo_model(model_name, use_segmentation=use_segmentation)
     
     # Connect to robot
-    sock = connect_to_robot()
+    sock = connect_to_robot(robot_ip, robot_port)
     
     # Run navigation loop
     final_iterations = run_navigation_loop(sock, model, use_ollama, ai_decide, target, capture_video=capture_video, target_confidence=target_confidence)
@@ -1078,12 +1032,18 @@ def main(use_ollama=False, ai_decide=False, target='chair', use_segmentation=Fal
 
 
 if __name__ == '__main__':
+    # Robot connection settings
+    robot_ip = '192.168.4.1'
+    robot_port = 100
+    
     use_ollama = False  # Deprecated: use full Ollama navigation
     ai_decide =  False    # NEW: Use AI for decision making with YOLO detection
-    target = 'chair'     # Target object class to search for
+    # target = 'backpack'   
+    # target = 'person' 
+    target = 'sports ball'   # Target object class to search for
     use_segmentation = True  # Use YOLO segmentation model for better object understanding
     capture_video = True  # Record navigation video with logs
-    target_confidence = 0.60  # Minimum confidence threshold for target detection
+    target_confidence = 0.1  # Minimum confidence threshold for target detection
     
     # Rule 3: Target confirmation configuration
     rule3_enabled = True  # Enable target confirmation when close to object
@@ -1091,4 +1051,5 @@ if __name__ == '__main__':
     
     main(use_ollama, ai_decide, target, use_segmentation,
           capture_video, target_confidence,
-          rule3_enabled, rule3_area_threshold)
+          rule3_enabled, rule3_area_threshold,
+          robot_ip, robot_port)

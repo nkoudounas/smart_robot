@@ -9,7 +9,7 @@ import time
 OBJECT_SIZES = {
     'person': 0.45,      # Average shoulder width
     'chair': 0.50,  
-    'ball': 0.24,        # Average ball diameter
+    'sports ball': 0.24,        # Average ball diameter
     'couch': 1.80,       # Average couch width
     'dining table': 1.20,
     'tv': 1.00,

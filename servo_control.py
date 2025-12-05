@@ -28,13 +28,13 @@ handler.setFormatter(colorlog.ColoredFormatter(
 logger.addHandler(handler)
 
 
-def connect_to_robot():
+def connect_to_robot(ip='192.168.4.1', port=100):
     """Establish connection to robot - identical to fcam.py"""
-    logger.info("Connecting to robot at 192.168.4.1:100...")
+    logger.info(f"Connecting to robot at {ip}:{port}...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10.0)
-        sock.connect(('192.168.4.1', 100))
+        sock.connect((ip, port))
         
         # Apply socket options (same as fcam.py)
         setup_socket_options(sock)
@@ -285,13 +285,17 @@ def execute_command(sock, action, value):
 
 def main():
     """Main interactive loop"""
+    # Robot connection settings
+    robot_ip = '192.168.4.1'
+    robot_port = 100
+    
     # Print banner
     logger.info("\n" + "="*50)
     logger.info("🤖 Robot Servo Interactive Control")
     logger.info("="*50)
     
     # Connect to robot
-    sock = connect_to_robot()
+    sock = connect_to_robot(robot_ip, robot_port)
     
     # Print help
     print_help()

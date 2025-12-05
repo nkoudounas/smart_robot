@@ -1,5 +1,5 @@
 """  
-Navigation functions for robot movement and obstacle avoidance
+Navigation functions for robot movement and vision-based navigation
 """
 
 import cv2 as cv
@@ -8,7 +8,7 @@ import time
 import re
 import numpy as np
 from .detection_utils import detect_objects_yolo, get_largest_object
-from .robot_utils import cmd, read_distance, read_ir_sensors
+from .robot_utils import cmd, read_ir_sensors
 from .tts_utils import speak
 # Setup logger
 logger = colorlog.getLogger(__name__)
@@ -312,13 +312,13 @@ def ai_search_decision(sock, og_annotated_img, model, target_class, capture_call
 
 # Movement timing configuration
 MOVEMENT_DELAYS = {
-    'forward': 1,        # After autonomous forward movement in navigation
+    'forward': 3,        # After autonomous forward movement in navigation
     'back': 0.8,           # After backing up during obstacle avoidance
     'left': 0.3,           # After left turns in navigation
     'right': 0.3,          # After right turns in navigation
     'manual': 0.1,         # After manual arrow key controls
-    'unstuck_back': 0.5,   # Initial backup in vision-based stuck recovery
-    'unstuck_turn': 0.5,   # Turns during vision-based stuck recovery scanning
+    'unstuck_back': 0.4,   # Initial backup in vision-based stuck recovery
+    'unstuck_turn': 0.4,   # Turns during vision-based stuck recovery scanning
     'default': 1.0,         # Main loop delay between navigation iterations (longer for AI decisions)
     'target_on_sides': 1.5   # when target on right or left, but far away (area based) !
 }
@@ -326,19 +326,19 @@ MOVEMENT_DELAYS = {
 # Movement speed configuration (0-100)
 # Can be overridden by importing module
 MOVEMENT_SPEEDS = {
-    'forward_normal': 150,    # When exploring or no objects detected
+    'forward_normal': 180,    # When exploring or no objects detected
     'left_normal': 60,       # Normal left turns  avoiding obstacles
     'right_normal': 60,      # Normal right turns  avoiding obstacles
 
     'back_avoid': 80,    # Initial backup in vision-based stuck recovery
-    'left_unstuck': 70,      # vision-based stuck recovery scanning & positioning
-    'right_unstuck':70,      # vision-based stuck recovery scanning & positioning
+    'left_unstuck': 60,      # vision-based stuck recovery scanning & positioning
+    'right_unstuck':60,      # vision-based stuck recovery scanning & positioning
 
     'right_avoid': 60,       # Right turns to avoid obstacles
 
     'no_target_search': 60,     # Slow rotation when searching for target
     'default': 50,           # Fallback for any unspecified movement
-    'target_on_sides': 80    # when target on right or left, but far away (area based) !
+    'target_on_sides': 120    # when target on right or left, but far away (area based) !
 }
 
 
@@ -516,38 +516,6 @@ def calculate_path_openness(image):
     return total_score
 
 
-def ultrasonic_safety_check(sock, threshold=30):
-    """
-    Ultrasonic safety check before moving forward.
-    Reads distance sensor and backs up + turns if obstacle too close.
-    
-    Args:
-        sock: Robot socket connection
-        threshold: Distance threshold in cm (default 30cm)
-    
-    Returns:
-        tuple: (safe: bool, distance: float or None)
-               safe=True means clear to proceed, safe=False means obstacle avoided
-    """
-    distance = read_distance(sock)
-    logger.info(f"🔍 Ultrasonic reading: {distance}cm")
-    
-    # Treat 0 as "obstacle very close" - sensor might return 0 for objects too close to measure
-    # If distance is 0-threshold, something is very close
-    if distance is not None and 0 <= distance <= threshold:
-        logger.error(f"⚠️ ULTRASONIC ALERT: Object at {distance}cm - backing up!")
-        logger.debug("\033[93m↓ Moving BACKWARD\033[0m")  # Yellow
-        cmd(sock, 'move', where='back', at=movement_speed('back_avoid'))
-        time.sleep(0.5)  # Let it back up
-        
-        # Then turn to avoid
-        logger.debug("\033[96m→ Turning RIGHT to avoid\033[0m")  # Cyan
-        cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-        return False, distance  # Not safe, obstacle avoided
-    
-    return True, distance  # Safe to proceed
-
-
 def smart_search_for_target(sock, og_annotated_img, model, target_class, capture_callback, reconnect_callback):
     """
     Intelligently search for target by scanning left, center, right with camera rotation.
@@ -653,7 +621,7 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
     """
     Navigate the robot based on YOLO object detection.
     - target_class: specific object class to follow (e.g., 'person', 'cup', 'chair','ball')
-    - avoid_classes: list of classes to avoid (e.g., ['person', 'chair', 'dog','ball'])
+    - avoid_classes: (deprecated) not used anymore
     - ai_decide: if True, use AI decision (must provide ai_decision parameter)
     - ai_decision: Pre-computed AI decision string (if ai_decide=True)
     - objects: Pre-detected objects list (optional, will detect if not provided)
@@ -740,34 +708,8 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
             
             # Hardcoded Logic Mode (original behavior)
             else:
-                # If there are other objects blocking the path, avoid them first
-                if other_objects:
-                    blocking_objects = [obj for obj in other_objects 
-                                      if obj['area'] > width * height * 0.08 and obj['position'] == 'center']
-                    if blocking_objects:
-                        blocker = max(blocking_objects, key=lambda x: x['area'])
-                        logger.warning(f"⚠️ {blocker['class']} blocking path to {target_class}! Avoiding...")
-                        if video_logger and video_logger.is_recording:
-                            video_logger.add_log(f"⚠️ {blocker['class']} blocking path! Avoiding", "WARNING")
-                        logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                        cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                        return ('avoid_blocker', MOVEMENT_DELAYS['right'])
-                
                 # Navigate toward target
                 if target['position'] == 'center':
-                    # Before moving forward, check again for any blocking objects (more aggressive check)
-                    if other_objects:
-                        blocking_objects = [obj for obj in other_objects 
-                                          if obj['area'] > width * height * 0.05 and obj['position'] == 'center']
-                        if blocking_objects:
-                            blocker = max(blocking_objects, key=lambda x: x['area'])
-                            logger.warning(f"⚠️ {blocker['class']} directly blocking forward path! Avoiding...")
-                            if video_logger and video_logger.is_recording:
-                                video_logger.add_log(f"⚠️ {blocker['class']} directly blocking! Avoiding", "WARNING")
-                            logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                            cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                            return ('avoid_blocker', MOVEMENT_DELAYS['right'])
-                    
                     # Check if close enough (object is large)
                     if target['area'] > width * height * 0.3:
                         logger.info(f"Reached {target_class}, stopping")
@@ -777,11 +719,6 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
                         cmd(sock, 'stop')
                         return ('reached', 0.3)
                     else:
-                        # ULTRASONIC SAFETY CHECK before moving forward (DISABLED - sensor not working)
-                        # safe, distance = ultrasonic_safety_check(sock, threshold=30)
-                        # if not safe:
-                        #     return 'ultrasonic_avoid'
-                        
                         logger.info(f"Target {target_class} centered, moving forward")
                         if video_logger and video_logger.is_recording:
                             video_logger.add_log(f"Target {target_class} centered, moving forward", "INFO")
@@ -854,37 +791,6 @@ def navigate_with_yolo(sock, img, model, target_class=None, avoid_classes=None, 
             # Don't send movement command here - smart_search will handle it
             # Just return signal to trigger smart search in fcam.py
             return ('searching', MOVEMENT_DELAYS['default'])
-    
-    # Avoid obstacles mode
-    if avoid_classes:
-        obstacles = [obj for obj in objects if obj['class'] in avoid_classes]
-    else:
-        obstacles = objects  # Avoid all detected objects
-    
-    if obstacles:
-        # Find largest/closest obstacle
-        obstacle = get_largest_object(obstacles)
-        logger.warning(f"obstacle: {obstacle}\n")
-        # If obstacle is too close (large area), take action
-        if obstacle['area'] > width * height * 0.15:
-            logger.error(f"Avoiding {obstacle['class']} ({obstacle['position']})")
-            if obstacle['position'] == 'center':
-                logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                cmd(sock, 'move', where='right', at=movement_speed('right_avoid'))
-                return ('avoid_right', MOVEMENT_DELAYS['right'])
-            elif obstacle['position'] == 'left':
-                logger.debug("\033[96m→ Turning RIGHT\033[0m")  # Cyan
-                cmd(sock, 'move', where='right', at=movement_speed('right_normal'))
-                return ('avoid_right', MOVEMENT_DELAYS['right'])
-            else:  # right
-                logger.debug("\033[95m← Turning LEFT\033[0m")  # Magenta
-                cmd(sock, 'move', where='left', at=movement_speed('left_normal'))
-                return ('avoid_left', MOVEMENT_DELAYS['left'])
-        else:
-            # Obstacles far enough, can move forward
-            logger.debug("\033[92m↑ Moving FORWARD\033[0m")  # Green
-            cmd(sock, 'move', where='forward', at=movement_speed('forward_normal'))
-            return ('forward', MOVEMENT_DELAYS['forward'])
     
     return ('idle', 0.3)
 
