@@ -135,15 +135,24 @@ def detect_objects_yolo(img, model, confidence=0.5, target_class=None):
                 thickness = 3 if is_target else 2
                 cv.rectangle(img, (x1, y1), (x2, y2), color, thickness)
                 
-                # Build label with target indicator
+                # Build label with target indicator and area
                 label = f'{class_name} {conf:.2f}'
                 if is_target:
                     label = f'🎯 {label}'
                 
-                # Draw label background for better readability
+                # Add area on second line below the bbox
+                area_label = f'{area:.0f}px²'
+                
+                # Draw top label (class + confidence) background for better readability
                 (label_w, label_h), _ = cv.getTextSize(label, cv.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv.rectangle(img, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
                 cv.putText(img, label, (x1, y1 - 5), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Draw bottom label (area) inside bbox at bottom
+                (area_w, area_h), _ = cv.getTextSize(area_label, cv.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                area_y = y2 - 5  # Position inside bbox, 5px from bottom
+                cv.rectangle(img, (x1, area_y - area_h - 5), (x1 + area_w + 10, area_y + 5), color, -1)
+                cv.putText(img, area_label, (x1 + 5, area_y), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 
                 objects.append({
                     'class': class_name,
